@@ -1,0 +1,2 @@
+/usr/bin/ar qc libminilog.a CMakeFiles/minilog.dir/src/minilog.cpp.o
+/usr/bin/ranlib libminilog.a
