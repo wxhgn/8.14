@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.16)
+project(kk)
+set(CMAKE_CXX_STANDARD 17)
+add_library(socket_fd STATIC socket_fd.cpp)
+find_package(minilog REQUIRED NO_MODULE)
+find_package(Threads REQUIRED)
+add_executable(serve serve.cpp)
+add_executable(client client.cpp)
+
+target_link_libraries(client PRIVATE minilog::minilog Threads::Threads socket_fd)
+target_link_libraries(serve PRIVATE minilog::minilog Threads::Threads socket_fd)
