@@ -1,0 +1,5 @@
+/usr/local/lib/libminilog.a
+/usr/local/include/minilog.h
+/usr/local/lib/cmake/minilog/minilogTargets.cmake
+/usr/local/lib/cmake/minilog/minilogTargets-noconfig.cmake
+/usr/local/lib/cmake/minilog/minilogConfig.cmake
