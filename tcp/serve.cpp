@@ -1,123 +1,153 @@
 #include <iostream>
-#include <vector>
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <errno.h>
 
-// 设置fd为非阻塞
+#define MAX_EVENTS 1024
+#define PORT 8888
+
+// 工具函数：把fd设置成非阻塞
 int set_nonblock(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
-    if(flags == -1) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 int main()
 {
+    // 1. 创建监听socket listenfd
     int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    set_nonblock(listenfd); //监听fd也设置非阻塞
+    if(listenfd < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+    set_nonblock(listenfd); // 监听fd设置非阻塞
+
+    // 端口复用，避免重启服务器端口被TIME_WAIT占用
+    int opt = 1;
+    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(8888);
+    serv_addr.sin_port = htons(PORT);
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    bind(listenfd, (sockaddr*)&serv_addr, sizeof(serv_addr));
-    listen(listenfd, 5);
+    if(bind(listenfd, (sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
+    {
+        perror("bind");
+        close(listenfd);
+        return -1;
+    }
 
-    fd_set readfds;
-    std::vector<int> client_fds;
+    if(listen(listenfd, 5) < 0)
+    {
+        perror("listen");
+        close(listenfd);
+        return -1;
+    }
 
+    // 2. 创建epoll实例
+    int epfd = epoll_create(MAX_EVENTS);
+    if(epfd < 0)
+    {
+        perror("epoll_create");
+        close(listenfd);
+        return -1;
+    }
+
+    struct epoll_event ev;
+    ev.data.fd = listenfd;
+    // ET边缘触发 EPOLLET
+    ev.events = EPOLLIN | EPOLLET;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+
+    struct epoll_event events[MAX_EVENTS];
+
+    // 主循环
     while(true)
     {
-        FD_ZERO(&readfds);
-        FD_SET(listenfd, &readfds);
-
-        int maxfd = listenfd;
-        for(int fd : client_fds)
+        int nready = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        if(nready < 0)
         {
-            FD_SET(fd, &readfds);
-            if(fd > maxfd) maxfd = fd;
-        }
-
-        // select阻塞等待事件
-        int ret = select(maxfd + 1, &readfds, nullptr, nullptr, nullptr);
-        if(ret < 0)
-        {
-            perror("select");
+            perror("epoll_wait");
             break;
         }
 
-        // 1. listenfd就绪：新连接到来
-        if(FD_ISSET(listenfd, &readfds))
+        for(int i = 0; i < nready; i++)
         {
-            // 非阻塞accept，有可能没有连接（多连接同时到达）
-            while(true)
+            int fd = events[i].data.fd;
+            if(fd == listenfd)
             {
-                int connfd = accept(listenfd, nullptr, nullptr);
-                if(connfd == -1)
+                // 情况1：listenfd就绪，有新客户端连接
+                while(true)
                 {
-                    // EAGAIN 代表没有更多新连接了，退出循环
-                    if(errno == EAGAIN || errno == EWOULDBLOCK)
+                    sockaddr_in cli_addr;
+                    socklen_t cli_len = sizeof(cli_addr);
+                    int connfd = accept(listenfd, (sockaddr*)&cli_addr, &cli_len);
+                    if(connfd == -1)
+                    {
+                        // EAGAIN 内核连接队列空了，退出循环
+                        if(errno == EAGAIN || errno == EWOULDBLOCK)
+                        {
+                            break;
+                        }
+                        perror("accept");
                         break;
-                    perror("accept");
-                    break;
-                }
-                set_nonblock(connfd); // 客户端fd设置非阻塞！！
-                client_fds.push_back(connfd);
-                std::cout << "new client: " << connfd << std::endl;
-            }
-        }
+                    }
+                    set_nonblock(connfd); // 新客户端fd设为非阻塞
+                    std::cout << "新客户端接入: " << inet_ntoa(cli_addr.sin_addr) << std::endl;
 
-        // 2.处理客户端可读事件
-        for(size_t i = 0; i < client_fds.size(); )
-        {
-            int fd = client_fds[i];
-            if(FD_ISSET(fd, &readfds))
+                    // 注册connfd到epoll，ET模式监听可读
+                    struct epoll_event conn_ev;
+                    conn_ev.data.fd = connfd;
+                    conn_ev.events = EPOLLIN | EPOLLET;
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &conn_ev);
+                }
+            }
+            else
             {
-                char buf[1024]{0};
-                // 非阻塞recv，while循环读完缓冲区全部数据
+                // 情况2：客户端connfd就绪，收到消息
+                char buf[1024] = {0};
                 while(true)
                 {
                     int n = recv(fd, buf, sizeof(buf)-1, 0);
                     if(n > 0)
                     {
-                        std::cout << "recv: " << buf << std::endl;
-                        send(fd, buf, n, 0); // echo回显
-                        memset(buf,0,sizeof(buf));
+                        std::cout << "收到消息: " << buf << std::endl;
+                        send(fd, buf, n, 0); // echo回显，把消息发回去
+                        memset(buf, 0, sizeof(buf));
                     }
                     else if(n == 0)
                     {
-                        // 客户端关闭连接
+                        // n=0：客户端关闭连接
+                        std::cout << "客户端断开: " << fd << std::endl;
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                         close(fd);
-                        client_fds.erase(client_fds.begin()+i);
-                        goto next_client; //跳出两层循环
+                        break;
                     }
-                    else // n < 0
+                    else
                     {
+                        // n<0
                         if(errno == EAGAIN || errno == EWOULDBLOCK)
                         {
-                            // 缓冲区读完了，没有更多数据，正常退出
+                            // 缓冲区全部读完，退出循环
                             break;
                         }
-                        // 真正出错
+                        perror("recv");
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                         close(fd);
-                        client_fds.erase(client_fds.begin()+i);
-                        goto next_client;
+                        break;
                     }
                 }
-                i++;
             }
-            else
-            {
-                i++;
-            }
-next_client:;
         }
     }
     close(listenfd);
+    close(epfd);
     return 0;
 }
