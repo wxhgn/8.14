@@ -1,123 +1,132 @@
 #include <iostream>
-#include <vector>
-#include <cstring>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <errno.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <cstring>
 
-// 设置fd为非阻塞
-int set_nonblock(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    if(flags == -1) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
+// 函数声明
+void sigChildHandler(int sig);
+int createListenSocket(int port);
+void handleClient(int connfd);
+
 
 int main()
 {
-    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    set_nonblock(listenfd); //监听fd也设置非阻塞
+    int port = 8888;
+    signal(SIGCHLD, sigChildHandler);
 
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(8888);
-    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    bind(listenfd, (sockaddr*)&serv_addr, sizeof(serv_addr));
-    listen(listenfd, 5);
-
-    fd_set readfds;
-    std::vector<int> client_fds;
-
-    while(true)
+    int listenfd = createListenSocket(port);
+    if (listenfd < 0)
     {
-        FD_ZERO(&readfds);
-        FD_SET(listenfd, &readfds);
+        std::cerr << "创建监听socket失败\n";
+        return -1;
+    }
+    std::cout << "服务端启动，监听端口 " << port << std::endl;
 
-        int maxfd = listenfd;
-        for(int fd : client_fds)
+    while (true)
+    {
+        struct sockaddr_in cli_addr;
+        socklen_t cli_len = sizeof(cli_addr);
+        int connfd = accept(listenfd,
+                            reinterpret_cast<struct sockaddr*>(&cli_addr),
+                            &cli_len);
+        if (connfd < 0)
         {
-            FD_SET(fd, &readfds);
-            if(fd > maxfd) maxfd = fd;
+            perror("accept");
+            continue;
         }
 
-        // select阻塞等待事件
-        int ret = select(maxfd + 1, &readfds, nullptr, nullptr, nullptr);
-        if(ret < 0)
-        {
-            perror("select");
-            break;
-        }
+        std::cout << "新客户端接入 IP:"
+                  << inet_ntoa(cli_addr.sin_addr)
+                  << " port:" << ntohs(cli_addr.sin_port) << std::endl;
 
-        // 1. listenfd就绪：新连接到来
-        if(FD_ISSET(listenfd, &readfds))
+        pid_t pid = fork();
+        if (pid < 0)
         {
-            // 非阻塞accept，有可能没有连接（多连接同时到达）
-            while(true)
-            {
-                int connfd = accept(listenfd, nullptr, nullptr);
-                if(connfd == -1)
-                {
-                    // EAGAIN 代表没有更多新连接了，退出循环
-                    if(errno == EAGAIN || errno == EWOULDBLOCK)
-                        break;
-                    perror("accept");
-                    break;
-                }
-                set_nonblock(connfd); // 客户端fd设置非阻塞！！
-                client_fds.push_back(connfd);
-                std::cout << "new client: " << connfd << std::endl;
-            }
+            perror("fork");
+            close(connfd);
+            continue;
         }
-
-        // 2.处理客户端可读事件
-        for(size_t i = 0; i < client_fds.size(); )
+        else if (pid == 0)
         {
-            int fd = client_fds[i];
-            if(FD_ISSET(fd, &readfds))
-            {
-                char buf[1024]{0};
-                // 非阻塞recv，while循环读完缓冲区全部数据
-                while(true)
-                {
-                    int n = recv(fd, buf, sizeof(buf)-1, 0);
-                    if(n > 0)
-                    {
-                        std::cout << "recv: " << buf << std::endl;
-                        send(fd, buf, n, 0); // echo回显
-                        memset(buf,0,sizeof(buf));
-                    }
-                    else if(n == 0)
-                    {
-                        // 客户端关闭连接
-                        close(fd);
-                        client_fds.erase(client_fds.begin()+i);
-                        goto next_client; //跳出两层循环
-                    }
-                    else // n < 0
-                    {
-                        if(errno == EAGAIN || errno == EWOULDBLOCK)
-                        {
-                            // 缓冲区读完了，没有更多数据，正常退出
-                            break;
-                        }
-                        // 真正出错
-                        close(fd);
-                        client_fds.erase(client_fds.begin()+i);
-                        goto next_client;
-                    }
-                }
-                i++;
-            }
-            else
-            {
-                i++;
-            }
-next_client:;
+            // 子进程：处理客户端通信
+            close(listenfd);
+            handleClient(connfd);
+            _exit(0);
+        }
+        else
+        {
+            // 父进程：继续等待新连接，关闭connfd
+            close(connfd);
         }
     }
+
     close(listenfd);
     return 0;
+}
+
+
+// SIGCHLD信号回调，非阻塞回收僵尸进程
+void sigChildHandler(int sig)
+{
+    (void)sig;
+    while (waitpid(-1, nullptr, WNOHANG) > 0)
+    {
+        // 循环收割所有已经退出的子进程
+    }
+}
+
+
+// 创建监听socket：socket -> setsockopt -> bind -> listen
+int createListenSocket(int port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    // 端口复用，解决重启服务TIME_WAIT占用端口
+    int opt = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_addr.s_addr = INADDR_ANY;
+    srv_addr.sin_port = htons(port);
+
+    if (bind(lfd, reinterpret_cast<struct sockaddr*>(&srv_addr), sizeof(srv_addr)) < 0)
+    {
+        perror("bind");
+        close(lfd);
+        return -1;
+    }
+
+    if (listen(lfd, 128) < 0)
+    {
+        perror("listen");
+        close(lfd);
+        return -1;
+    }
+    return lfd;
+}
+
+
+// 客户端业务：读取数据，原样回显（echo回射服务器）
+void handleClient(int connfd)
+{
+    char buf[1024];
+    ssize_t n;
+    while ((n = read(connfd, buf, sizeof(buf)-1)) > 0)
+    {
+        buf[n] = '\0';
+        std::cout << "收到客户端：" << buf << std::endl;
+        write(connfd, buf, n);
+    }
+    std::cout << "客户端连接断开\n";
+    close(connfd);
 }
