@@ -9,3 +9,7 @@ add_executable(client client.cpp)
 
 target_link_libraries(client PRIVATE minilog::minilog Threads::Threads socket_fd)
 target_link_libraries(serve PRIVATE minilog::minilog Threads::Threads socket_fd)
+target_include_directories(client PRIVATE /usr/include/mysql)
+target_link_libraries(client PRIVATE mysqlclient)
+target_include_directories(serve PRIVATE /usr/include/mysql)
+target_link_libraries(serve PRIVATE mysqlclient)
