@@ -38,6 +38,8 @@ const char* DB_NAME = "chat_db";
 unsigned int DB_PORT = 3306;
 
 // ==================== 只在主线程读写的表 ====================
+using TimeoutItem =pair<chrono::steady_clock::time_point,int>;
+priority_queue<TimeoutItem,vector<TimeoutItem>,greater<TimeoutItem> >g_timeout_heap;
 unordered_map<int, vector<char>> fd_recv_buf;
 unordered_map<int, vector<char>> fd_send_buf;
 unordered_map<int, string>       online_clients;
@@ -280,6 +282,12 @@ if(need_mod){
 }
 }
 
+void update_fd_active(int fd){
+    auto now=chrono::steady_clock::now();
+    auto expire_time=now+chrono::seconds(IDLE_TIMEOUT_SEC);
+    g_timeout_heap.emplace(expire_time,fd);
+    fd_last_active[fd]=now;
+}
 // ==================== DB 操作 ====================
 int db_login(MYSQL* conn, const string& req) {
     size_t pos = req.find(':');
@@ -445,18 +453,20 @@ int main()
     {
         int nready = epoll_wait(epfd, events, MAX_EVENTS, 10);
         auto now=chrono::steady_clock::now();
-        vector<int>idle_fds;
-        for(auto &p:fd_last_active){
-            int fd=p.first;
-            auto&t=p.second;
-            if(chrono::duration_cast<chrono::seconds>(now-t).count()>IDLE_TIMEOUT_SEC){
-                idle_fds.push_back(fd);
-            }
-        }
-        for(int fd:idle_fds){
-            cout<<"[LOG] idle timeout close fd:"<<fd<<endl;
-            clean_fd_with_log(fd,epfd);
-        }
+         while(!g_timeout_heap.empty()){
+            auto&top_item=g_timeout_heap.top();
+            auto expire_time=top_item.first;
+            int fd=top_item.second;
+            if(expire_time>now)break;
+            g_timeout_heap.pop();
+            if(!fd_alive(fd))continue;
+            auto real_time=fd_last_active[fd];
+            if(chrono::duration_cast<chrono::seconds>(now-real_time).count()-IDLE_TIMEOUT_SEC){
+                LOG_I("idle timeout close");
+                clean_fd_with_log(fd,epfd);
+            } 
+
+         }
         if(nready < 0) {
             if(errno == EINTR) continue;
             perror("epoll_wait");
@@ -510,12 +520,13 @@ int main()
                         int connfd = accept4(listenfd, (sockaddr*)&cli_addr,
                                              &cli_len,
                                              SOCK_NONBLOCK | SOCK_CLOEXEC);
+
                         if(connfd == -1) {
                             if(errno == EAGAIN || errno == EWOULDBLOCK) break;
                             perror("accept");
                             break;
                         }
-
+                        update_fd_active(connfd);
                         fd_recv_buf[connfd] = vector<char>();
                         fd_send_buf[connfd] = vector<char>();
                         online_clients[connfd] = inet_ntoa(cli_addr.sin_addr);
@@ -543,7 +554,6 @@ int main()
                 while((n = recv(fd, tem, sizeof(tem), 0)) > 0) {
                     fd_recv_buf[fd].insert(fd_recv_buf[fd].end(), tem, tem + n);
                 }
-                   fd_last_active[fd]=chrono::steady_clock::now();
                 if(n == 0) {
                     cout << "[LOG] 客户端下线 fd=" << fd
                          << " ip=" << online_clients[fd] << endl;
@@ -557,7 +567,7 @@ int main()
                     clean_fd_with_log(fd, epfd);
                     continue;
                 }
-
+                update_fd_active(fd);
                 vector<char>& buf = fd_recv_buf[fd];
                 bool need_close = false;
                 while(true) {
@@ -639,7 +649,7 @@ int main()
                 bool closed = false;
                 while(!buf.empty()) {
                     int ret = send(fd, buf.data(), buf.size(), MSG_NOSIGNAL);
-                    fd_last_active[fd]=chrono::steady_clock::now();
+                   
                     if(ret < 0) {
                         if(errno == EAGAIN || errno == EWOULDBLOCK) {
                             break;
@@ -649,7 +659,8 @@ int main()
                         closed = true;
                         break;
                     }
-                    if(ret == 0) break;
+                    if(ret == 0) break; 
+                update_fd_active(fd);
                     buf.erase(buf.begin(), buf.begin() + ret);
                 }
                 if(closed) continue;
