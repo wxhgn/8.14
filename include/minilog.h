@@ -5,6 +5,8 @@
 #include <sstream>
 #include <ctime>
 #include <fstream>
+#include <cstdarg>
+#include <cstdio>
 
 enum class Level {
     DEBUG,
@@ -20,7 +22,10 @@ public:
     void setMaxSize(size_t bytes);
     void setMinLevel(Level level);
     void setFile(const std::string& path);
+    // 纯字符串版本
     void print(Level level, const std::string& msg);
+    // printf可变参数格式化版本
+    void printf(Level level, const char* fmt, ...);
 
     Minilog(const Minilog&) = delete;
     Minilog& operator=(const Minilog&) = delete;
@@ -41,7 +46,8 @@ private:
     bool enableFile = false;
 };
 
-#define LOG_D(msg) Minilog::getInstance().print(Level::DEBUG, msg)
-#define LOG_I(msg) Minilog::getInstance().print(Level::INFO, msg)
-#define LOG_W(msg) Minilog::getInstance().print(Level::WARN, msg)
-#define LOG_E(msg) Minilog::getInstance().print(Level::ERROR, msg)
+// 可变参数宏，##__VA_ARGS__兼容无参数场景 LOG_I("hello")
+#define LOG_D(fmt, ...) Minilog::getInstance().printf(Level::DEBUG, fmt, ##__VA_ARGS__)
+#define LOG_I(fmt, ...) Minilog::getInstance().printf(Level::INFO, fmt, ##__VA_ARGS__)
+#define LOG_W(fmt, ...) Minilog::getInstance().printf(Level::WARN, fmt, ##__VA_ARGS__)
+#define LOG_E(fmt, ...) Minilog::getInstance().printf(Level::ERROR, fmt, ##__VA_ARGS__)
