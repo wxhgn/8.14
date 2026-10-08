@@ -1,8 +1,0 @@
-build/
-*.log
-.vscode
-serve
-client
-*.a
-CMakeCache.txt
-Makefile
