@@ -29,22 +29,10 @@
 
 using namespace std;
 
-// ===================== 简化日志（替换 minilog.h） =====================
-// 若你项目已有 minilog.h，删除下面这段，改为 #include "minilog.h"
-enum class Level { DEBUG, INFO, WARN, ERROR };
-namespace Minilog {
-class Logger {
-public:
-    static Logger& getInstance() { static Logger l; return l; }
-    void setFile(const string&) {}
-    void setMinLevel(Level) {}
-};
-}
-#define LOG_I(fmt, ...) do{ printf("[INFO ] " fmt "\n", ##__VA_ARGS__); }while(0)
-#define LOG_W(fmt, ...) do{ printf("[WARN ] " fmt "\n", ##__VA_ARGS__); }while(0)
-#define LOG_E(fmt, ...) do{ printf("[ERROR] " fmt "\n", ##__VA_ARGS__); }while(0)
-// ======================================================================
-
+// ========== 补日志宏（兼容你原来LOG_*，不想引入minilog） ==========
+#define LOG_I(fmt, ...) printf("[I] " fmt "\n", ##__VA_ARGS__)
+#define LOG_W(fmt, ...) printf("[W] " fmt "\n", ##__VA_ARGS__)
+#define LOG_E(fmt, ...) printf("[E] " fmt "\n", ##__VA_ARGS__)
 
 // ===================== 宏配置 =====================
 #define IDLE_TIMEOUT_SEC 60
@@ -82,8 +70,14 @@ inline void assert_is_main_thread() {
 #endif
 }
 
+// ===================== muduo风格回调类型定义 =====================
+class ConnEvent;
+using ConnectionCallback  = function<void(const shared_ptr<ConnEvent>&)>;
+using MessageCallback     = function<void(const shared_ptr<ConnEvent>&, const string&)>;
+using WriteCompleteCallback = function<void(const shared_ptr<ConnEvent>&)>;
+using CloseCallback       = function<void(const shared_ptr<ConnEvent>&)>;
 
-// ==================== IoContext ====================
+// ==================== IoContext（原样保留，一行不改） ====================
 using TimeoutItem = pair<chrono::steady_clock::time_point, int>;
 
 class IoContext {
@@ -234,8 +228,128 @@ public:
 
 IoContext g_io_ctx;
 
+// ==================== ConnEvent：封装fd+回调（muduo TcpConnection思想） ====================
+class ConnEvent : public enable_shared_from_this<ConnEvent>
+{
+public:
+    int fd_{-1};
+    int epfd_{-1};
+    uint64_t session_id_{0};
+    string ip_;
 
-// ==================== ReplyTask（必须先定义） ====================
+    ConnectionCallback conn_cb_;
+    MessageCallback msg_cb_;
+    WriteCompleteCallback write_complete_cb_;
+    CloseCallback close_cb_;
+
+    ConnEvent(int fd, int epfd, string ip, uint64_t sid)
+        : fd_(fd), epfd_(epfd), ip_(move(ip)), session_id_(sid)
+    {}
+
+    void setConnectionCallback(ConnectionCallback cb) { conn_cb_ = move(cb); }
+    void setMessageCallback(MessageCallback cb) { msg_cb_ = move(cb); }
+    void setWriteCompleteCallback(WriteCompleteCallback cb) { write_complete_cb_ = move(cb); }
+    void setCloseCallback(CloseCallback cb) { close_cb_ = move(cb); }
+
+    // 读事件入口
+    void handleRead()
+    {
+        assert_is_main_thread();
+        char tem[1024];
+        int n = 0;
+        auto& recv_buf = g_io_ctx.get_recv_buf(fd_);
+        while ((n = recv(fd_, tem, sizeof(tem), 0)) > 0) {
+            recv_buf.insert(recv_buf.end(), tem, tem + n);
+        }
+        if (n == 0) {
+            LOG_I("客户端下线 fd=%d ip=%s", fd_, g_io_ctx.get_ip(fd_).c_str());
+            if (close_cb_) close_cb_(shared_from_this());
+            return;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("recv");
+            LOG_I("客户端异常下线 fd=%d", fd_);
+            if (close_cb_) close_cb_(shared_from_this());
+            return;
+        }
+        g_io_ctx.update_fd_active(fd_);
+
+        bool need_close = false;
+        while (true) {
+            if (recv_buf.size() < 4) break;
+            uint32_t net_len;
+            memcpy(&net_len, recv_buf.data(), 4);
+            uint32_t body_len = ntohl(net_len);
+            if (body_len > MAX_MSG_LEN) {
+                LOG_W("body_len 超限 fd=%d", fd_);
+                need_close = true;
+                break;
+            }
+            if (recv_buf.size() < 4 + body_len) break;
+
+            string msg(recv_buf.data() + 4, recv_buf.data() + 4 + body_len);
+            recv_buf.erase(recv_buf.begin(), recv_buf.begin() + 4 + body_len);
+            g_total_recv_mgs.fetch_add(1);
+
+            // 收到完整包，触发message回调（业务入口）
+            if (msg_cb_) {
+                msg_cb_(shared_from_this(), msg);
+            }
+        }
+        if (need_close) {
+            if (close_cb_) close_cb_(shared_from_this());
+        }
+    }
+
+    // 写事件入口
+    void handleWrite()
+    {
+        assert_is_main_thread();
+        auto& buf = g_io_ctx.get_send_buf(fd_);
+        if (buf.empty()) {
+            struct epoll_event ev_out;
+            ev_out.data.fd = fd_;
+            ev_out.events  = EPOLLIN | EPOLLET;
+            epoll_ctl(epfd_, EPOLL_CTL_MOD, fd_, &ev_out);
+            return;
+        }
+        bool closed = false;
+        while (!buf.empty()) {
+            int ret = send(fd_, buf.data(), buf.size(), MSG_NOSIGNAL);
+            if (ret < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                LOG_E("send error fd=%d", fd_);
+                if (close_cb_) close_cb_(shared_from_this());
+                closed = true;
+                break;
+            }
+            if (ret == 0) break;
+            buf.erase(buf.begin(), buf.begin() + ret);
+        }
+        if (closed) return;
+        if (buf.empty()) {
+            struct epoll_event ev_out;
+            ev_out.data.fd = fd_;
+            ev_out.events  = EPOLLIN | EPOLLET;
+            epoll_ctl(epfd_, EPOLL_CTL_MOD, fd_, &ev_out);
+            // 发送缓冲区清空，触发写完成回调
+            if (write_complete_cb_) {
+                write_complete_cb_(shared_from_this());
+            }
+        }
+    }
+
+    // 对外发送接口（等价muduo::TcpConnection::send）
+    void send(const string& msg)
+    {
+        sent_msg(fd_, msg, epfd_);
+    }
+};
+
+// fd -> ConnEvent 映射（主线程访问）
+unordered_map<int, shared_ptr<ConnEvent>> g_fd_conn_map;
+
+// ==================== ReplyTask（原样保留） ====================
 struct ReplyTask {
     int      fd         = -1;
     uint64_t session_id = 0;
@@ -244,8 +358,7 @@ struct ReplyTask {
     string   username;
 };
 
-
-// ==================== SafeQueue ====================
+// ==================== SafeQueue（原样保留） ====================
 atomic<bool> g_pool_running{true};
 
 template<typename T>
@@ -258,11 +371,11 @@ private:
 public:
     explicit SafeQueue(int max_sz) : max_size(max_sz) {}
 
-    bool push(T val) {
+    bool push(T&&val) {
         {
             lock_guard<mutex> lock(mtx);
             if ((int)q.size() >= max_size) return false;
-            q.push(move(val));
+            q.emplace(std::forward<T>(val));
         }
         cv.notify_one();
         return true;
@@ -293,8 +406,7 @@ public:
     void notify_all() { cv.notify_all(); }
 };
 
-
-// ==================== Message 基类（提前定义） ====================
+// ==================== Message 基类（原样保留） ====================
 class Message {
 public:
     int      fd         = -1;
@@ -304,7 +416,6 @@ public:
     virtual void handle(MYSQL* conn) = 0;
     virtual ~Message() = default;
 };
-
 
 // ==================== 派生类声明 ====================
 class LoginMsg : public Message {
@@ -328,21 +439,18 @@ public:
     void handle(MYSQL* conn) override;
 };
 
-
-// ==================== 全局队列（类型已齐） ====================
+// ==================== 全局队列 ====================
 SafeQueue<unique_ptr<Message>> business_queue{QUEUE_MAX_SIZE};
 SafeQueue<ReplyTask>           reply_queue{QUEUE_MAX_SIZE};
 vector<thread>                 g_thread_pool;
 
-
-// ==================== DB 函数声明（handle 实现里要用） ====================
+// ==================== DB 函数声明 ====================
 int  db_login(MYSQL* conn, const string& req);
 void db_insert_msg(MYSQL* conn, int sender_id, const string& msg);
 void db_insert_online_log(MYSQL* conn, int user_id,
                           const string& ip, const string& event);
 
-
-// ==================== handle 实现（此时队列、DB 声明都可见） ====================
+// ==================== handle 实现 ====================
 void LoginMsg::handle(MYSQL* conn) {
     int uid = db_login(conn, username + ":" + password);
 
@@ -381,8 +489,11 @@ void LogoutMsg::handle(MYSQL* conn) {
     db_insert_online_log(conn, uid, ip, "logout");
 }
 
+int db_login(MYSQL*conn,const string &req);
+void db_insert_msg(MYSQL*conn,int sender_id,const string&msg);
+void db_insert_online_log(MYSQL*conn,int user_id,const string& ip,const string&event);
 
-// ==================== MySQL 连接池 ====================
+// ==================== MySQL 连接池（原样保留） ====================
 class MySQLConnPool {
 private:
     queue<MYSQL*> m_conn_queue;
@@ -426,7 +537,7 @@ public:
     MYSQL* get_conn(int timeout_ms = 5000) {
         unique_lock<mutex> lock(m_mtx);
         auto deadline = chrono::steady_clock::now()
-                      + chrono::milliseconds(timeout_ms);
+                        + chrono::milliseconds(timeout_ms);
         while (true) {
             if (!m_conn_queue.empty()) {
                 MYSQL* conn = m_conn_queue.front();
@@ -478,8 +589,7 @@ public:
 
 unique_ptr<MySQLConnPool> g_pool;
 
-
-// ==================== 工具函数 ====================
+// ==================== 工具函数（原样保留） ====================
 void broadcast(int sender_fd, const string& msg, int epfd);
 
 vector<string> split(const string& s, char sep) {
@@ -517,6 +627,7 @@ void clean_fd(int fd, int epfd) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     g_io_ctx.clean_fd(fd);
+    g_fd_conn_map.erase(fd);
 }
 
 void sent_msg(int fd, const string& msg, int epfd) {
@@ -528,7 +639,6 @@ void sent_msg(int fd, const string& msg, int epfd) {
 
     if (buf.size() + pack.size() > MAX_SEND_BUF_SIZE) {
         LOG_E("fd send buf overflow, close fd=%d", fd);
-        // 注意：此处不直接清理，避免与调用方冲突；仅丢弃本次
         return;
     }
     if (buf.size() + pack.size() >= SEND_BUF_SOFT_LIMIT) {
@@ -558,11 +668,11 @@ void clean_fd_with_log(int fd, int epfd) {
     string username = g_io_ctx.get_username(fd);
 
     if (uid != -1) {
-        auto task = make_unique<LogoutMsg>();   // ✅ 补上 >
+        auto task = make_unique<LogoutMsg>();
         task->fd         = fd;
         task->session_id = g_io_ctx.get_session(fd);
         task->ip         = g_io_ctx.get_ip(fd);
-        task->uid        = uid;                 // ✅ 补上 uid
+        task->uid        = uid;
 
         bool push_ok = business_queue.push(move(task));
         if (push_ok) {
@@ -575,6 +685,79 @@ void clean_fd_with_log(int fd, int epfd) {
     clean_fd(fd, epfd);
 }
 
+// ==================== 【重点】四个muduo风格回调实现 ====================
+void onConnection(const shared_ptr<ConnEvent>& conn)
+{
+    LOG_I("新客户端接入 fd=%d session=%lu ip=%s",
+          conn->fd_, (unsigned long)conn->session_id_, conn->ip_.c_str());
+}
+
+void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
+{
+    int fd = conn->fd_;
+    auto parts = split(pkg, '|');
+    if (parts.empty()) return;
+    int msg_type = atoi(parts[0].c_str());
+
+    if (msg_type == 0) { // 登录
+        if (parts.size() < 3) return;
+        string user = parts[1];
+        string pwd  = parts[2];
+
+        auto task = make_unique<LoginMsg>();
+        task->fd         = fd;
+        task->username   = user;
+        task->password   = pwd;
+        task->session_id = g_io_ctx.get_session(fd);
+        task->ip         = g_io_ctx.get_ip(fd);
+
+        bool ok = business_queue.push(move(task));
+        if (!ok) {
+            LOG_W("business queue full fd=%d", fd);
+            conn->send("1|sys|server busy");
+        }
+        g_business_queue_size = (int)business_queue.size();
+    }
+    else if (msg_type == 1) { // 聊天
+        int uid = g_io_ctx.get_uid(fd);
+        if (uid != -1) {
+            auto task = make_unique<ChatMsg>();
+            task->username   = parts[1];
+            task->fd         = fd;
+            task->uid        = uid;
+            task->session_id = g_io_ctx.get_session(fd);
+            task->content    = parts[2];
+            bool ok = business_queue.push(move(task));
+            if (!ok) {
+                LOG_W("business queue full fd=%d", fd);
+                conn->send("1|sys|server busy");
+            }
+            g_business_queue_size = (int)business_queue.size();
+        } else {
+            conn->send("1|sys|please login first");
+        }
+    }
+    else if (msg_type == 4) { // 心跳
+        LOG_I("recv ping fd=%d", fd);
+        g_io_ctx.update_fd_active(fd);
+        conn->send("5|pong");
+    }
+    else {
+        conn->send("unknown msg_type");
+    }
+}
+
+void onWriteComplete(const shared_ptr<ConnEvent>& conn)
+{
+    // 发送缓冲区清空回调，这里你可以加限流、统计逻辑
+    // LOG_I("write complete fd=%d", conn->fd_);
+}
+
+void onClose(const shared_ptr<ConnEvent>& conn)
+{
+    LOG_I("连接关闭回调 fd=%d", conn->fd_);
+    clean_fd_with_log(conn->fd_, conn->epfd_);
+}
 
 // ==================== DB 操作实现 ====================
 int db_login(MYSQL* conn, const string& req) {
@@ -637,11 +820,10 @@ void db_insert_online_log(MYSQL* conn, int user_id,
     }
 }
 
-
 // ==================== worker ====================
 void worker() {
     while (g_pool_running.load()) {
-        unique_ptr<Message> msg;                    // ✅ 正确类型
+        unique_ptr<Message> msg;
         if (!business_queue.pop(msg)) {
             if (!g_pool_running.load()) break;
             continue;
@@ -654,23 +836,18 @@ void worker() {
             continue;
         }
 
-        msg->handle(conn);                          // ✅ 多态调用
+        msg->handle(conn);
 
         g_pool->return_conn(conn);
     }
 }
 
-
-// ==================== main ====================
+// ==================== main / epoll主循环（精简！不再堆业务） ====================
 int main()
 {
     signal(SIGINT, sig_handler);
     signal(SIGPIPE, SIG_IGN);
     g_main_thread_id = std::this_thread::get_id();
-
-    // 若使用 minilog.h，请取消注释：
-    // Minilog::getInstance().setFile("multi1.log");
-    // Minilog::getInstance().setMinLevel(Level::DEBUG);
 
     g_pool = make_unique<MySQLConnPool>(DB_HOST, DB_USER, DB_PWD,
                                         DB_NAME, DB_PORT, 8);
@@ -712,7 +889,7 @@ int main()
     g_last_stat_print = chrono::steady_clock::now();
     uint64_t last_msg_cnt = 0;
 
-    // ============ epoll 主循环 ============
+    // ============ epoll 主循环（EventLoop，非常干净） ============
     while (g_pool_running.load())
     {
         int nready = epoll_wait(epfd, events, MAX_EVENTS, 10);
@@ -733,7 +910,10 @@ int main()
         // 1. 空闲超时
         vector<int> timeout_fds = g_io_ctx.handle_timeout();
         for (int fd : timeout_fds) {
-            clean_fd_with_log(fd, epfd);
+            auto it = g_fd_conn_map.find(fd);
+            if(it != g_fd_conn_map.end()){
+                if(it->second->close_cb_) it->second->close_cb_(it->second);
+            }
         }
 
         if (nready < 0) {
@@ -763,11 +943,17 @@ int main()
                 vector<int> to_kick = g_io_ctx.find_same_uid_fd(new_fd, new_uid);
                 for (int kick_fd : to_kick) {
                     LOG_E("kick old fd=%d", kick_fd);
-                    clean_fd_with_log(kick_fd, epfd);
+                    auto it = g_fd_conn_map.find(kick_fd);
+                    if(it != g_fd_conn_map.end()){
+                        if(it->second->close_cb_) it->second->close_cb_(it->second);
+                    }
                 }
                 g_io_ctx.set_uid_and_name(new_fd, new_uid, rt.username);
             }
-            sent_msg(rt.fd, rt.reply_msg, epfd);
+            auto it_conn = g_fd_conn_map.find(rt.fd);
+            if(it_conn != g_fd_conn_map.end()){
+                it_conn->second->send(rt.reply_msg);
+            }
         }
 
         // 3. 处理 epoll 就绪事件
@@ -794,8 +980,16 @@ int main()
                         uint64_t sid = g_io_ctx.add_new_conn(connfd, ip);
                         g_io_ctx.update_fd_active(connfd);
 
-                        LOG_I("新客户端接入 fd=%d session=%lu ip=%s",
-                              connfd, (unsigned long)sid, ip.c_str());
+                        // 新建连接对象、注册4个回调（muduo核心）
+                        auto conn = make_shared<ConnEvent>(connfd, epfd, ip, sid);
+                        conn->setConnectionCallback(onConnection);
+                        conn->setMessageCallback(onMessage);
+                        conn->setWriteCompleteCallback(onWriteComplete);
+                        conn->setCloseCallback(onClose);
+                        g_fd_conn_map[connfd] = conn;
+
+                        // 触发连接建立回调
+                        if(conn->conn_cb_) conn->conn_cb_(conn);
 
                         struct epoll_event conn_ev;
                         conn_ev.data.fd = connfd;
@@ -806,145 +1000,19 @@ int main()
                 continue;
             }
 
-            // -------- 读事件 --------
-            if (revents & EPOLLIN) {
-                if (!g_io_ctx.fd_alive(fd)) continue;
+            auto it = g_fd_conn_map.find(fd);
+            if(it == g_fd_conn_map.end()) continue;
+            auto conn = it->second;
 
-                char tem[1024];
-                int n = 0;
-                auto& recv_buf = g_io_ctx.get_recv_buf(fd);
-                while ((n = recv(fd, tem, sizeof(tem), 0)) > 0) {
-                    recv_buf.insert(recv_buf.end(), tem, tem + n);
-                }
-                if (n == 0) {
-                    LOG_I("客户端下线 fd=%d ip=%s",
-                          fd, g_io_ctx.get_ip(fd).c_str());
-                    clean_fd_with_log(fd, epfd);
-                    continue;
-                }
-                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    perror("recv");
-                    LOG_I("客户端异常下线 fd=%d", fd);
-                    clean_fd_with_log(fd, epfd);
-                    continue;
-                }
-                g_io_ctx.update_fd_active(fd);
-
-                bool need_close = false;
-                // 拆包
-                while (true) {
-                    if (recv_buf.size() < 4) break;
-
-                    uint32_t net_len;
-                    memcpy(&net_len, recv_buf.data(), 4);
-                    uint32_t body_len = ntohl(net_len);
-
-                    if (body_len > MAX_MSG_LEN) {
-                        LOG_W("body_len 超限 fd=%d", fd);
-                        need_close = true;
-                        break;
-                    }
-                    if (recv_buf.size() < 4 + body_len) break;
-
-                    string msg(recv_buf.data() + 4,
-                               recv_buf.data() + 4 + body_len);
-                    recv_buf.erase(recv_buf.begin(),
-                                   recv_buf.begin() + 4 + body_len);
-
-                    g_total_recv_mgs.fetch_add(1);
-
-                    auto parts = split(msg, '|');
-                    if (parts.empty()) continue;
-                    int msg_type = atoi(parts[0].c_str());
-
-                    if (msg_type == 0) {              // 登录
-                        if (parts.size() < 3) continue;
-                        string user = parts[1];
-                        string pwd  = parts[2];
-
-                        auto task = make_unique<LoginMsg>();
-                        task->fd         = fd;
-                        task->username   = user;
-                        task->password   = pwd;
-                        task->session_id = g_io_ctx.get_session(fd);
-                        task->ip         = g_io_ctx.get_ip(fd);
-
-                        bool ok = business_queue.push(move(task));
-                        if (!ok) {
-                            LOG_W("business queue full fd=%d", fd);
-                            sent_msg(fd, "1|sys|server busy", epfd);
-                        }
-                        g_business_queue_size = (int)business_queue.size();
-                    }
-                    else if (msg_type == 1) {         // 聊天
-                        int uid = g_io_ctx.get_uid(fd);
-                        if (uid != -1) {
-                            auto task = make_unique<ChatMsg>();
-                            task->username   = parts[1];
-                            task->fd         = fd;
-                            task->uid        = uid;
-                            task->session_id = g_io_ctx.get_session(fd);
-                            task->content    = parts[2];    // ✅ content
-                            bool ok = business_queue.push(move(task));
-                            if (!ok) {
-                                LOG_W("business queue full fd=%d", fd);
-                                sent_msg(fd, "1|sys|server busy", epfd);
-                            }
-                            g_business_queue_size = (int)business_queue.size();
-                        } else {
-                            sent_msg(fd, "1|sys|please login first", epfd);
-                        }
-                    }
-                    else if (msg_type == 4) {         // 心跳
-                        LOG_I("recv ping fd=%d", fd);
-                        g_io_ctx.update_fd_active(fd);
-                        sent_msg(fd, "5|pong", epfd);
-                    }
-                    else {
-                        sent_msg(fd, "unknown msg_type", epfd);
-                    }
-                }
-
-                if (need_close) {
-                    clean_fd_with_log(fd, epfd);
-                    continue;
-                }
+            if (revents & (EPOLLERR | EPOLLHUP)) {
+                if(conn->close_cb_) conn->close_cb_(conn);
+                continue;
             }
-
-            // -------- 写事件 --------
+            if (revents & EPOLLIN) {
+                conn->handleRead();
+            }
             if (revents & EPOLLOUT) {
-                if (!g_io_ctx.fd_alive(fd)) continue;
-
-                auto& buf = g_io_ctx.get_send_buf(fd);
-                if (buf.empty()) {
-                    struct epoll_event ev_out;
-                    ev_out.data.fd = fd;
-                    ev_out.events  = EPOLLIN | EPOLLET;
-                    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev_out);
-                    continue;
-                }
-
-                bool closed = false;
-                while (!buf.empty()) {
-                    int ret = send(fd, buf.data(), buf.size(), MSG_NOSIGNAL);
-                    if (ret < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        LOG_E("send error fd=%d", fd);
-                        clean_fd_with_log(fd, epfd);
-                        closed = true;
-                        break;
-                    }
-                    if (ret == 0) break;
-                    buf.erase(buf.begin(), buf.begin() + ret);
-                }
-                if (closed) continue;
-
-                if (buf.empty()) {
-                    struct epoll_event ev_out;
-                    ev_out.data.fd = fd;
-                    ev_out.events  = EPOLLIN | EPOLLET;
-                    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev_out);
-                }
+                conn->handleWrite();
             }
         }
     }
