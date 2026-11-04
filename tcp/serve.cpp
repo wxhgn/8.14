@@ -29,7 +29,7 @@
 
 using namespace std;
 
-// ========== 补日志宏（兼容你原来LOG_*，不想引入minilog） ==========
+// ========== 日志宏 ==========
 #define LOG_I(fmt, ...) printf("[I] " fmt "\n", ##__VA_ARGS__)
 #define LOG_W(fmt, ...) printf("[W] " fmt "\n", ##__VA_ARGS__)
 #define LOG_E(fmt, ...) printf("[E] " fmt "\n", ##__VA_ARGS__)
@@ -40,10 +40,10 @@ using namespace std;
 #define PORT         8888
 #define THREAD_NUM   4
 #define MAX_MSG_LEN  (64 * 1024)
-#define MAX_SEND_BUF_SIZE (256*1024)
-#define SEND_BUF_SOFT_LIMIT (64*1024)
-#define SEND_BUF_LOW_LIMIT (16*1024)
-#define CONN_CACHE_MAX_CNT 500   // 单个连接缓存消息上限
+#define MAX_SEND_BUF_SIZE   (256*1024)
+#define SEND_BUF_SOFT_LIMIT (64*1024)   // 高水位
+#define SEND_BUF_LOW_LIMIT  (16*1024)   // 低水位
+#define CONN_CACHE_MAX_CNT  500         // 单连接暂停时缓存消息上限
 
 atomic<uint64_t> g_total_recv_mgs{0};
 atomic<int>      g_online_conn{0};
@@ -72,16 +72,128 @@ inline void assert_is_main_thread() {
 #endif
 }
 
-// ===================== muduo风格回调类型定义 =====================
-class ConnEvent;
-using ConnectionCallback  = function<void(const shared_ptr<ConnEvent>&)>;
-using MessageCallback     = function<void(const shared_ptr<ConnEvent>&, const string&)>;
-using WriteCompleteCallback = function<void(const shared_ptr<ConnEvent>&)>;
-using CloseCallback       = function<void(const shared_ptr<ConnEvent>&)>;
-using HighWaterMarkCallback = function<void(const shared_ptr<ConnEvent>&, size_t)>;
-using LowWaterMarkCallback  = function<void(const shared_ptr<ConnEvent>&)>;
+// ===================== Channel + EpollPoller 封装（muduo风格） =====================
+class Channel;
+class EpollPoller;
 
-// ==================== IoContext（原样保留，一行不改） ====================
+class Channel
+{
+public:
+    using ReadCallback = function<void()>;
+    using WriteCallback = function<void()>;
+    using CloseCallback = function<void()>;
+    using ErrorCallback = function<void()>;
+
+    Channel(int fd) : fd_(fd), events_(0), revents_(0) {}
+
+    int fd() const { return fd_; }
+    uint32_t events() const { return events_; }
+    void set_revents(uint32_t r) { revents_ = r; }
+
+    void setReadCallback(ReadCallback cb) { read_cb_ = move(cb); }
+    void setWriteCallback(WriteCallback cb) { write_cb_ = move(cb); }
+    void setCloseCallback(CloseCallback cb) { close_cb_ = move(cb); }
+    void setErrorCallback(ErrorCallback cb) { error_cb_ = move(cb); }
+
+    void enableReading()  { events_ |= EPOLLIN; }
+    void disableReading() { events_ &= ~EPOLLIN; }
+    void enableWriting()  { events_ |= EPOLLOUT; }
+    void disableWriting() { events_ &= ~EPOLLOUT; }
+
+    bool isReading() const { return events_ & EPOLLIN; }
+    bool isWriting() const { return events_ & EPOLLOUT; }
+
+    void handleEvent()
+    {
+        if (revents_ & (EPOLLERR | EPOLLHUP)) {
+            if (error_cb_) error_cb_();
+            if (close_cb_) close_cb_();
+            return;
+        }
+        if (revents_ & EPOLLIN) {
+            if (read_cb_) read_cb_();
+        }
+        if (revents_ & EPOLLOUT) {
+            if (write_cb_) write_cb_();
+        }
+    }
+
+private:
+    int fd_;
+    uint32_t events_;
+    uint32_t revents_;
+    ReadCallback read_cb_;
+    WriteCallback write_cb_;
+    CloseCallback close_cb_;
+    ErrorCallback error_cb_;
+};
+
+class EpollPoller
+{
+public:
+    EpollPoller()
+    {
+        epfd_ = epoll_create1(0);
+        assert(epfd_ >= 0);
+    }
+    ~EpollPoller() { close(epfd_); }
+
+    void updateChannel(Channel* ch)
+    {
+        int fd = ch->fd();
+        struct epoll_event ev;
+        ev.data.fd = fd;
+        ev.events = ch->events() | EPOLLET;
+        epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev);
+    }
+    void addChannel(Channel* ch)
+    {
+        int fd = ch->fd();
+        struct epoll_event ev;
+        ev.data.fd = fd;
+        ev.events = ch->events() | EPOLLET;
+        epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev);
+    }
+    void removeChannel(Channel* ch)
+    {
+        int fd = ch->fd();
+        epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
+    }
+
+    void poll(int timeoutMs, vector<Channel*>& activeChannels)
+    {
+        activeChannels.clear();
+        struct epoll_event evs[MAX_EVENTS];
+        int n = epoll_wait(epfd_, evs, MAX_EVENTS, timeoutMs);
+        for (int i = 0; i < n; ++i)
+        {
+            int fd = evs[i].data.fd;
+            uint32_t rev = evs[i].events;
+            auto it = fd2chan_.find(fd);
+            if (it != fd2chan_.end())
+            {
+                it->second->set_revents(rev);
+                activeChannels.push_back(it->second);
+            }
+        }
+    }
+    void registerChannel(Channel* ch)
+    {
+        fd2chan_[ch->fd()] = ch;
+    }
+    void unregisterChannel(int fd)
+    {
+        fd2chan_.erase(fd);
+    }
+
+private:
+    int epfd_;
+    unordered_map<int, Channel*> fd2chan_;
+};
+
+EpollPoller* g_poller = nullptr;
+
+// ==================== IoContext ====================
 using TimeoutItem = pair<chrono::steady_clock::time_point, int>;
 
 class IoContext {
@@ -231,16 +343,28 @@ public:
 };
 
 IoContext g_io_ctx;
-void sent_msg(int fd,const string&msg,int epfd,std::shared_ptr<ConnEvent>conn);
-vector<char>pack_msg(const string&s);
-// ==================== ConnEvent：封装fd+回调（muduo TcpConnection思想） ====================
+
+// ==================== muduo风格回调类型定义 ====================
+class ConnEvent;
+using ConnectionCallback  = function<void(const shared_ptr<ConnEvent>&)>;
+using MessageCallback     = function<void(const shared_ptr<ConnEvent>&, const string&)>;
+using WriteCompleteCallback = function<void(const shared_ptr<ConnEvent>&)>;
+using CloseCallback       = function<void(const shared_ptr<ConnEvent>&)>;
+using HighWaterMarkCallback = function<void(const shared_ptr<ConnEvent>&, size_t)>;
+using LowWaterMarkCallback  = function<void(const shared_ptr<ConnEvent>&)>;
+
+// ==================== 前向声明 ====================
+vector<char> pack_msg(const string& s);
+void sent_msg(int fd, const string& msg, shared_ptr<ConnEvent> conn);
+
+// ==================== ConnEvent ====================
 class ConnEvent : public enable_shared_from_this<ConnEvent>
 {
 public:
     int fd_{-1};
-    int epfd_{-1};
     uint64_t session_id_{0};
     string ip_;
+    Channel* channel_{nullptr};
 
     ConnectionCallback conn_cb_;
     MessageCallback msg_cb_;
@@ -248,15 +372,16 @@ public:
     CloseCallback close_cb_;
     HighWaterMarkCallback high_water_cb_;
     LowWaterMarkCallback  low_water_cb_;
+
     size_t high_water_mark_{SEND_BUF_SOFT_LIMIT};
     size_t low_water_mark_{SEND_BUF_LOW_LIMIT};
 
     bool pause_send_ = false;
-    queue<string> cache_msg_queue_;
     bool high_triggered_ = false;
+    queue<string> cache_msg_queue_;
 
-    ConnEvent(int fd, int epfd, string ip, uint64_t sid)
-        : fd_(fd), epfd_(epfd), ip_(move(ip)), session_id_(sid)
+    ConnEvent(int fd, string ip, uint64_t sid, Channel* ch)
+        : fd_(fd), ip_(move(ip)), session_id_(sid), channel_(ch)
     {}
 
     void setConnectionCallback(ConnectionCallback cb) { conn_cb_ = move(cb); }
@@ -287,6 +412,7 @@ public:
     }
     bool isPauseSend() const { return pause_send_; }
 
+    // 把缓存消息尽量补进 send_buf，并用 Channel 接口打开 EPOLLOUT
     void flushCacheMsg()
     {
         assert_is_main_thread();
@@ -306,10 +432,9 @@ public:
         checkWaterMark();
         if (!send_buf.empty())
         {
-            struct epoll_event ev;
-            ev.data.fd = fd_;
-            ev.events  = EPOLLIN | EPOLLET | EPOLLOUT;
-            epoll_ctl(epfd_, EPOLL_CTL_MOD, fd_, &ev);
+            channel_->enableReading();
+            channel_->enableWriting();
+            g_poller->updateChannel(channel_);
         }
     }
 
@@ -321,18 +446,12 @@ public:
         if (len >= high_water_mark_ && !high_triggered_)
         {
             high_triggered_ = true;
-            if (high_water_cb_)
-            {
-                high_water_cb_(shared_from_this(), len);
-            }
+            if (high_water_cb_) high_water_cb_(shared_from_this(), len);
         }
         else if (len <= low_water_mark_ && high_triggered_)
         {
             high_triggered_ = false;
-            if (low_water_cb_)
-            {
-                low_water_cb_(shared_from_this());
-            }
+            if (low_water_cb_) low_water_cb_(shared_from_this());
         }
     }
 
@@ -389,10 +508,9 @@ public:
         assert_is_main_thread();
         auto& buf = g_io_ctx.get_send_buf(fd_);
         if (buf.empty()) {
-            struct epoll_event ev_out;
-            ev_out.data.fd = fd_;
-            ev_out.events  = EPOLLIN | EPOLLET;
-            epoll_ctl(epfd_, EPOLL_CTL_MOD, fd_, &ev_out);
+            channel_->enableReading();
+            channel_->disableWriting();
+            g_poller->updateChannel(channel_);
             return;
         }
         bool closed = false;
@@ -410,27 +528,23 @@ public:
         }
         if (closed) return;
 
-        checkWaterMark();
+        checkWaterMark();   // 每次写完检查水位
 
         if (buf.empty()) {
-            struct epoll_event ev_out;
-            ev_out.data.fd = fd_;
-            ev_out.events  = EPOLLIN | EPOLLET;
-            epoll_ctl(epfd_, EPOLL_CTL_MOD, fd_, &ev_out);
+            channel_->enableReading();
+            channel_->disableWriting();
+            g_poller->updateChannel(channel_);
             if (write_complete_cb_) {
                 write_complete_cb_(shared_from_this());
             }
         }
     }
 
-    void send(const string& msg)
-    {
-        sent_msg(fd_, msg, epfd_, shared_from_this());
-    }
+    void send(const string& msg);
 };
 
-// fd -> ConnEvent 映射（主线程访问）
 unordered_map<int, shared_ptr<ConnEvent>> g_fd_conn_map;
+unordered_map<int, shared_ptr<Channel>> g_fd_channel_map;
 
 // ==================== ReplyTask ====================
 struct ReplyTask {
@@ -500,7 +614,6 @@ public:
     virtual ~Message() = default;
 };
 
-// ==================== 派生类声明 ====================
 class LoginMsg : public Message {
 public:
     string username;
@@ -522,7 +635,6 @@ public:
     void handle(MYSQL* conn) override;
 };
 
-// ==================== 全局队列 ====================
 SafeQueue<unique_ptr<Message>> business_queue{QUEUE_MAX_SIZE};
 SafeQueue<ReplyTask>           reply_queue{QUEUE_MAX_SIZE};
 vector<thread>                 g_thread_pool;
@@ -571,10 +683,6 @@ void LogoutMsg::handle(MYSQL* conn) {
     if (uid <= 0) return;
     db_insert_online_log(conn, uid, ip, "logout");
 }
-
-int db_login(MYSQL*conn,const string &req);
-void db_insert_msg(MYSQL*conn,int sender_id,const string&msg);
-void db_insert_online_log(MYSQL*conn,int user_id,const string& ip,const string&event);
 
 // ==================== MySQL 连接池 ====================
 class MySQLConnPool {
@@ -673,7 +781,7 @@ public:
 unique_ptr<MySQLConnPool> g_pool;
 
 // ==================== 工具函数 ====================
-void broadcast(int sender_fd, const string& msg, int epfd);
+void broadcast(int sender_fd, const string& msg);
 
 vector<string> split(const string& s, char sep) {
     vector<string> tokens;
@@ -705,28 +813,30 @@ vector<char> pack_msg(const string& s) {
     return out;
 }
 
-void clean_fd(int fd, int epfd) {
+void clean_fd(int fd, Channel* ch) {
     assert_is_main_thread();
-    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+    g_poller->removeChannel(ch);
+    g_poller->unregisterChannel(fd);
     close(fd);
     g_io_ctx.clean_fd(fd);
     g_fd_conn_map.erase(fd);
+    g_fd_channel_map.erase(fd);
 }
 
-// ========== sent_msg 重写，支持pauseSend缓存 ==========
-void sent_msg(int fd, const string& msg, int epfd, shared_ptr<ConnEvent> conn) {
+// ========== sent_msg：支持 pauseSend 缓存 + Channel 接口管理 EPOLLOUT ==========
+void sent_msg(int fd, const string& msg, shared_ptr<ConnEvent> conn) {
     assert_is_main_thread();
     if (!g_io_ctx.fd_alive(fd)) return;
 
-    if (conn->isPauseSend())
-    {
-        if (conn->cache_msg_queue_.size() >= CONN_CACHE_MAX_CNT)
-        {
+    // 暂停发送：进缓存队列
+    if (conn->isPauseSend()) {
+        if (conn->cache_msg_queue_.size() >= CONN_CACHE_MAX_CNT) {
             LOG_W("fd=%d cache queue overflow, drop msg", fd);
             return;
         }
         conn->cache_msg_queue_.push(msg);
-        LOG_W("fd=%d paused, msg cache to queue, cache size=%zu", fd, conn->cache_msg_queue_.size());
+        LOG_W("fd=%d paused, msg cache to queue, cache size=%zu",
+              fd, conn->cache_msg_queue_.size());
         return;
     }
 
@@ -734,31 +844,39 @@ void sent_msg(int fd, const string& msg, int epfd, shared_ptr<ConnEvent> conn) {
     auto& buf = g_io_ctx.get_send_buf(fd);
 
     if (buf.size() + pack.size() > MAX_SEND_BUF_SIZE) {
-        LOG_E("fd send buf overflow, close fd=%d", fd);
+        LOG_E("fd=%d send buf overflow, drop msg (no close)", fd);
         return;
     }
+
     bool need_mod = buf.empty();
     buf.insert(buf.end(), pack.begin(), pack.end());
 
-    conn->checkWaterMark();
+    conn->checkWaterMark();   // 写入后检查水位
 
     if (need_mod) {
-        struct epoll_event ev;
-        ev.data.fd = fd;
-        ev.events  = EPOLLIN | EPOLLET | EPOLLOUT;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        conn->channel_->enableReading();
+        conn->channel_->enableWriting();
+        g_poller->updateChannel(conn->channel_);
     }
 }
 
-void broadcast(int sender_fd, const string& msg, int epfd) {
+void ConnEvent::send(const string& msg)
+{
+    sent_msg(fd_, msg, shared_from_this());
+}
+
+void broadcast(int sender_fd, const string& msg) {
     vector<int> targets = g_io_ctx.get_all_fd();
     for (int fd : targets) {
         if (fd == sender_fd) continue;
-        sent_msg(fd, msg, epfd, g_fd_conn_map[fd]);
+        auto it = g_fd_conn_map.find(fd);   // 用 find，避免 operator[] 插空指针
+        if (it != g_fd_conn_map.end() && it->second) {
+            it->second->send(msg);
+        }
     }
 }
 
-void clean_fd_with_log(int fd, int epfd) {
+void clean_fd_with_log(int fd, Channel* ch) {
     assert_is_main_thread();
     int uid = g_io_ctx.get_uid(fd);
     string username = g_io_ctx.get_username(fd);
@@ -776,12 +894,12 @@ void clean_fd_with_log(int fd, int epfd) {
         }
 
         string logout_body = "3|" + username + "|user logout";
-        broadcast(-1, logout_body, epfd);
+        broadcast(-1, logout_body);
     }
-    clean_fd(fd, epfd);
+    clean_fd(fd, ch);
 }
 
-// ==================== 五个muduo风格回调实现 ====================
+// ==================== 回调实现 ====================
 void onConnection(const shared_ptr<ConnEvent>& conn)
 {
     LOG_I("新客户端接入 fd=%d session=%lu ip=%s",
@@ -845,12 +963,18 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
 
 void onWriteComplete(const shared_ptr<ConnEvent>& conn)
 {
+    // LOG_I("write complete fd=%d", conn->fd_);
 }
 
 void onClose(const shared_ptr<ConnEvent>& conn)
 {
     LOG_I("连接关闭回调 fd=%d", conn->fd_);
-    clean_fd_with_log(conn->fd_, conn->epfd_);
+    auto it = g_fd_channel_map.find(conn->fd_);
+    if (it != g_fd_channel_map.end() && it->second) {
+        clean_fd_with_log(conn->fd_, it->second.get());
+    } else {
+        clean_fd_with_log(conn->fd_, nullptr);
+    }
 }
 
 void onHighWaterMark(const shared_ptr<ConnEvent>& conn, size_t len)
@@ -948,7 +1072,7 @@ void worker() {
     }
 }
 
-// ==================== main / epoll主循环 ====================
+// ==================== main ====================
 int main()
 {
     signal(SIGINT, sig_handler);
@@ -958,7 +1082,6 @@ int main()
     g_pool = make_unique<MySQLConnPool>(DB_HOST, DB_USER, DB_PWD,
                                         DB_NAME, DB_PORT, 8);
 
-    // ---- 监听 socket ----
     int listenfd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenfd < 0) { perror("socket"); return -1; }
     set_nonblock(listenfd);
@@ -978,27 +1101,68 @@ int main()
         perror("listen"); close(listenfd); return -1;
     }
 
-    int epfd = epoll_create(MAX_EVENTS);
-    if (epfd < 0) { perror("epoll_create"); close(listenfd); return -1; }
+    EpollPoller poller;
+    g_poller = &poller;
 
-    struct epoll_event ev;
-    ev.data.fd = listenfd;
-    ev.events  = EPOLLIN | EPOLLET;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+    Channel listenCh(listenfd);
+    listenCh.enableReading();
+    poller.registerChannel(&listenCh);
+    poller.addChannel(&listenCh);
 
-    // 启动 worker 线程池
+    listenCh.setReadCallback([&](){
+        while (true) {
+            sockaddr_in cli_addr;
+            socklen_t cli_len = sizeof(cli_addr);
+            int connfd = accept4(listenfd, (sockaddr*)&cli_addr,
+                                 &cli_len,
+                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if (connfd == -1) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                perror("accept");
+                break;
+            }
+            string ip = inet_ntoa(cli_addr.sin_addr);
+            uint64_t sid = g_io_ctx.add_new_conn(connfd, ip);
+            g_io_ctx.update_fd_active(connfd);
+
+            auto clientCh = make_shared<Channel>(connfd);
+            clientCh->enableReading();
+            poller.registerChannel(clientCh.get());
+            poller.addChannel(clientCh.get());
+
+            auto conn = make_shared<ConnEvent>(connfd, ip, sid, clientCh.get());
+            clientCh->setReadCallback([conn](){ conn->handleRead(); });
+            clientCh->setWriteCallback([conn](){ conn->handleWrite(); });
+            clientCh->setCloseCallback([conn](){
+                if (conn->close_cb_) conn->close_cb_(conn);
+            });
+
+            conn->setConnectionCallback(onConnection);
+            conn->setMessageCallback(onMessage);
+            conn->setWriteCompleteCallback(onWriteComplete);
+            conn->setCloseCallback(onClose);
+            conn->setHighWaterMarkCallback(onHighWaterMark, SEND_BUF_SOFT_LIMIT);
+            conn->setLowWaterMarkCallback(onLowWaterMark, SEND_BUF_LOW_LIMIT);
+
+            g_fd_conn_map[connfd] = conn;
+            g_fd_channel_map[connfd] = clientCh;
+
+            if (conn->conn_cb_) conn->conn_cb_(conn);
+        }
+    });
+
+    // 启动worker
     for (int i = 0; i < THREAD_NUM; i++) {
         g_thread_pool.emplace_back(worker);
     }
 
-    struct epoll_event events[MAX_EVENTS];
     g_last_stat_print = chrono::steady_clock::now();
     uint64_t last_msg_cnt = 0;
+    vector<Channel*> activeChannels;
 
-    // ============ epoll 主循环（EventLoop） ============
     while (g_pool_running.load())
     {
-        int nready = epoll_wait(epfd, events, MAX_EVENTS, 10);
+        poller.poll(10, activeChannels);
 
         auto now = chrono::steady_clock::now();
         auto dur = chrono::duration_cast<chrono::milliseconds>(now - g_last_stat_print);
@@ -1013,27 +1177,21 @@ int main()
             g_last_stat_print = now;
         }
 
-        // 1. 空闲超时
+        // 超时关闭
         vector<int> timeout_fds = g_io_ctx.handle_timeout();
         for (int fd : timeout_fds) {
             auto it = g_fd_conn_map.find(fd);
-            if(it != g_fd_conn_map.end()){
-                if(it->second->close_cb_) it->second->close_cb_(it->second);
+            if (it != g_fd_conn_map.end() && it->second) {
+                if (it->second->close_cb_) it->second->close_cb_(it->second);
             }
         }
 
-        if (nready < 0) {
-            if (errno == EINTR) continue;
-            perror("epoll_wait");
-            break;
-        }
-
-        // 2. 消费 worker 返回的 ReplyTask
+        // 消费reply
         ReplyTask rt;
         while (reply_queue.try_pop(rt))
         {
             if (rt.fd == -1) {
-                broadcast(-1, rt.reply_msg, epfd);
+                broadcast(-1, rt.reply_msg);
                 continue;
             }
             uint64_t cur_sid = g_io_ctx.get_session(rt.fd);
@@ -1050,87 +1208,42 @@ int main()
                 for (int kick_fd : to_kick) {
                     LOG_E("kick old fd=%d", kick_fd);
                     auto it = g_fd_conn_map.find(kick_fd);
-                    if(it != g_fd_conn_map.end()){
-                        if(it->second->close_cb_) it->second->close_cb_(it->second);
+                    if (it != g_fd_conn_map.end() && it->second) {
+                        if (it->second->close_cb_) it->second->close_cb_(it->second);
                     }
                 }
                 g_io_ctx.set_uid_and_name(new_fd, new_uid, rt.username);
             }
             auto it_conn = g_fd_conn_map.find(rt.fd);
-            if(it_conn != g_fd_conn_map.end()){
+            if (it_conn != g_fd_conn_map.end() && it_conn->second) {
                 it_conn->second->send(rt.reply_msg);
             }
         }
 
-        // 3. 遍历就绪事件
-        for (int i = 0; i < nready; i++)
+        // 事件分发
+        for (Channel* ch : activeChannels)
         {
-            int fd = events[i].data.fd;
-            if (fd == listenfd)
-            {
-                // accept 新连接
-                while (true)
-                {
-                    sockaddr_in client_addr{};
-                    socklen_t client_len = sizeof(client_addr);
-                    int clientfd = accept4(listenfd, (sockaddr*)&client_addr, &client_len, SOCK_NONBLOCK);
-                    if (clientfd < 0)
-                    {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        perror("accept4");
-                        goto end_accept;
-                    }
-                    char ip_buf[32];
-                    inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
-                    string ip_str = ip_buf;
-                    uint64_t sid = g_io_ctx.add_new_conn(clientfd, ip_str);
-
-                    auto new_conn = make_shared<ConnEvent>(clientfd, epfd, ip_str, sid);
-                    new_conn->setConnectionCallback(onConnection);
-                    new_conn->setMessageCallback(onMessage);
-                    new_conn->setWriteCompleteCallback(onWriteComplete);
-                    new_conn->setCloseCallback(onClose);
-                    // 注册高低水位回调
-                    new_conn->setHighWaterMarkCallback(onHighWaterMark, SEND_BUF_SOFT_LIMIT);
-                    new_conn->setLowWaterMarkCallback(onLowWaterMark, SEND_BUF_LOW_LIMIT);
-
-                    g_fd_conn_map[clientfd] = new_conn;
-                    struct epoll_event ev_client;
-                    ev_client.data.fd = clientfd;
-                    ev_client.events  = EPOLLIN | EPOLLET;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, clientfd, &ev_client);
-                    if (new_conn->conn_cb_) {
-                        new_conn->conn_cb_(new_conn);
-                    }
-                }
-end_accept:
-                ;
-            }
-            else
-            {
-                auto it = g_fd_conn_map.find(fd);
-                if (it == g_fd_conn_map.end()) continue;
-                auto conn = it->second;
-                uint32_t revents = events[i].events;
-                if (revents & (EPOLLIN | EPOLLERR | EPOLLHUP))
-                {
-                    conn->handleRead();
-                }
-                if (revents & EPOLLOUT)
-                {
-                    conn->handleWrite();
-                }
-            }
+            ch->handleEvent();
         }
     }
 
-    LOG_I("server shutdown begin");
+    // 优雅退出
     g_pool_running = false;
-    reply_queue.notify_all();
     business_queue.notify_all();
-    for(auto& t : g_thread_pool) t.join();
-    close(epfd);
+    reply_queue.notify_all();
+    for (auto& t : g_thread_pool) {
+        if (t.joinable()) t.join();
+    }
+
+    vector<int> fds = g_io_ctx.get_all_online_fd();
+    for (int fd : fds) {
+        auto it = g_fd_channel_map.find(fd);
+        if (it != g_fd_channel_map.end() && it->second) {
+            clean_fd(fd, it->second.get());
+        }
+    }
+
     close(listenfd);
-    LOG_I("server exit");
+    g_pool.reset();
     return 0;
 }
