@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(kk)
 set(CMAKE_CXX_STANDARD 17)
+add_compile_options(-Wall -Wextra)
+set(CMAEK_BUILD_TYPE DEBUG)
 add_library(socket_fd STATIC socket_fd.cpp)
 find_package(minilog REQUIRED NO_MODULE)
 find_package(Threads REQUIRED)

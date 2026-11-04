@@ -24,15 +24,12 @@
 #include <chrono>
 #include <cassert>
 #include <functional>
+#include<minilog.h>
 
 #include <mysql/mysql.h>
 
 using namespace std;
 
-// ========== 日志宏 ==========
-#define LOG_I(fmt, ...) printf("[I] " fmt "\n", ##__VA_ARGS__)
-#define LOG_W(fmt, ...) printf("[W] " fmt "\n", ##__VA_ARGS__)
-#define LOG_E(fmt, ...) printf("[E] " fmt "\n", ##__VA_ARGS__)
 
 // ===================== 宏配置 =====================
 #define IDLE_TIMEOUT_SEC 60
@@ -381,7 +378,7 @@ public:
     queue<string> cache_msg_queue_;
 
     ConnEvent(int fd, string ip, uint64_t sid, Channel* ch)
-        : fd_(fd), ip_(move(ip)), session_id_(sid), channel_(ch)
+        : fd_(fd),session_id_(sid),ip_(ip) ,channel_(ch)
     {}
 
     void setConnectionCallback(ConnectionCallback cb) { conn_cb_ = move(cb); }
@@ -784,13 +781,17 @@ unique_ptr<MySQLConnPool> g_pool;
 void broadcast(int sender_fd, const string& msg);
 
 vector<string> split(const string& s, char sep) {
-    vector<string> tokens;
-    stringstream ss(s);
-    string tmp;
-    while (getline(ss, tmp, sep)) {
-        if (!tmp.empty()) tokens.push_back(tmp);
+    vector<string>res;
+    size_t pos=0,prev=0;
+    while(pos<s.size()){
+        if(s[pos]==sep){
+            res.push_back(s.substr(prev,pos-prev));
+            prev=pos+1;
+        }
+        pos++;
     }
-    return tokens;
+    res.push_back(s.substr(prev));
+    return res;
 }
 
 void sig_handler(int sig) {
@@ -911,10 +912,14 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
     int fd = conn->fd_;
     auto parts = split(pkg, '|');
     if (parts.empty()) return;
+    if(parts.size()<3){
+        conn->send("1|sys|bad format");
+        return;
+    }
     int msg_type = atoi(parts[0].c_str());
 
     if (msg_type == 0) { // 登录
-        if (parts.size() < 3) return;
+        
         string user = parts[1];
         string pwd  = parts[2];
 
@@ -963,7 +968,7 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
 
 void onWriteComplete(const shared_ptr<ConnEvent>& conn)
 {
-    // LOG_I("write complete fd=%d", conn->fd_);
+    (void)conn;
 }
 
 void onClose(const shared_ptr<ConnEvent>& conn)
@@ -1061,10 +1066,15 @@ void worker() {
         g_business_queue_size = (int)business_queue.size();
 
         MYSQL* conn = g_pool->get_conn(5000);
-        if (conn == nullptr) {
-            LOG_E("get conn fail, drop task");
-            continue;
-        }
+     if (conn == nullptr) {
+    // 需要知道 fd 才能回，Message 里有 fd
+    ReplyTask rt;
+    rt.fd = msg->fd;
+    rt.session_id = msg->session_id;
+    rt.reply_msg = "1|sys|db busy";
+    reply_queue.push(move(rt));
+    continue;
+}
 
         msg->handle(conn);
 
