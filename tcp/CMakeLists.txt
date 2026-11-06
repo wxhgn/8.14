@@ -8,7 +8,7 @@ find_package(minilog REQUIRED NO_MODULE)
 find_package(Threads REQUIRED)
 add_executable(serve serve.cpp)
 add_executable(client client.cpp)
-
+target_include_directories(serve PRIVATE ${CMAEK_SOURCE_DIR})
 target_link_libraries(client PRIVATE minilog::minilog Threads::Threads socket_fd)
 target_link_libraries(serve PRIVATE minilog::minilog Threads::Threads socket_fd)
 target_include_directories(client PRIVATE /usr/include/mysql)
