@@ -27,8 +27,10 @@
 #include <functional>
 #include "buffer.h"
 #include<minilog.h>
-
+#include"TimerQueue.h"
 #include <mysql/mysql.h>
+#include"Channel.h"
+#include"EpollPoller.h"
 
 using namespace std;
 
@@ -48,6 +50,8 @@ atomic<int>      g_online_conn{0};
 atomic<int>      g_business_queue_size{0};
 chrono::steady_clock::time_point g_last_stat_print;
 const int QUEUE_MAX_SIZE = 200;
+void broadcast(int fd, const std::string& msg);
+class Channel;
 
 double calc_qps(uint64_t old_cnt, uint64_t new_cnt, int ms) {
     if (ms <= 0) return 0.0;
@@ -73,125 +77,6 @@ inline void assert_is_main_thread() {
 // wakeup fd 全局
 int g_wakeup_fd = -1;
 shared_ptr<Channel> g_wakeup_channel;
-
-// ===================== Channel + EpollPoller 封装（muduo风格） =====================
-class Channel;
-class EpollPoller;
-
-class Channel
-{
-public:
-    using ReadCallback = function<void()>;
-    using WriteCallback = function<void()>;
-    using CloseCallback = function<void()>;
-    using ErrorCallback = function<void()>;
-
-    Channel(int fd) : fd_(fd), events_(0), revents_(0) {}
-
-    int fd() const { return fd_; }
-    uint32_t events() const { return events_; }
-    void set_revents(uint32_t r) { revents_ = r; }
-
-    void setReadCallback(ReadCallback cb) { read_cb_ = move(cb); }
-    void setWriteCallback(WriteCallback cb) { write_cb_ = move(cb); }
-    void setCloseCallback(CloseCallback cb) { close_cb_ = move(cb); }
-    void setErrorCallback(ErrorCallback cb) { error_cb_ = move(cb); }
-
-    void enableReading()  { events_ |= EPOLLIN; }
-    void disableReading() { events_ &= ~EPOLLIN; }
-    void enableWriting()  { events_ |= EPOLLOUT; }
-    void disableWriting() { events_ &= ~EPOLLOUT; }
-
-    bool isReading() const { return events_ & EPOLLIN; }
-    bool isWriting() const { return events_ & EPOLLOUT; }
-
-    void handleEvent()
-    {
-        if (revents_ & (EPOLLERR | EPOLLHUP)) {
-            if (error_cb_) error_cb_();
-            if (close_cb_) close_cb_();
-            return;
-        }
-        if (revents_ & EPOLLIN) {
-            if (read_cb_) read_cb_();
-        }
-        if (revents_ & EPOLLOUT) {
-            if (write_cb_) write_cb_();
-        }
-    }
-
-private:
-    int fd_;
-    uint32_t events_;
-    uint32_t revents_;
-    ReadCallback read_cb_;
-    WriteCallback write_cb_;
-    CloseCallback close_cb_;
-    ErrorCallback error_cb_;
-};
-
-class EpollPoller
-{
-public:
-    EpollPoller()
-    {
-        epfd_ = epoll_create1(0);
-        assert(epfd_ >= 0);
-    }
-    ~EpollPoller() { close(epfd_); }
-
-    void updateChannel(Channel* ch)
-    {
-        int fd = ch->fd();
-        struct epoll_event ev;
-        ev.data.fd = fd;
-        ev.events = ch->events() | EPOLLET;
-        epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev);
-    }
-    void addChannel(Channel* ch)
-    {
-        int fd = ch->fd();
-        struct epoll_event ev;
-        ev.data.fd = fd;
-        ev.events = ch->events() | EPOLLET;
-        epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev);
-    }
-    void removeChannel(Channel* ch)
-    {
-        int fd = ch->fd();
-        epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
-    }
-
-    void poll(int timeoutMs, vector<Channel*>& activeChannels)
-    {
-        activeChannels.clear();
-        struct epoll_event evs[MAX_EVENTS];
-        int n = epoll_wait(epfd_, evs, MAX_EVENTS, timeoutMs);
-        for (int i = 0; i < n; ++i)
-        {
-            int fd = evs[i].data.fd;
-            uint32_t rev = evs[i].events;
-            auto it = fd2chan_.find(fd);
-            if (it != fd2chan_.end())
-            {
-                it->second->set_revents(rev);
-                activeChannels.push_back(it->second);
-            }
-        }
-    }
-    void registerChannel(Channel* ch)
-    {
-        fd2chan_[ch->fd()] = ch;
-    }
-    void unregisterChannel(int fd)
-    {
-        fd2chan_.erase(fd);
-    }
-
-private:
-    int epfd_;
-    unordered_map<int, Channel*> fd2chan_;
-};
 
 EpollPoller* g_poller = nullptr;
 
@@ -662,7 +547,7 @@ int  db_login(MYSQL* conn, const string& req);
 void db_insert_msg(MYSQL* conn, int sender_id, const string& msg);
 void db_insert_online_log(MYSQL* conn, int user_id,
                           const string& ip, const string& event);
-
+void broadcast(int fd, const std::string& msg);
 // wakeup 消费reply队列
 void handleWakeUp()
 {
@@ -1193,7 +1078,13 @@ int main()
 
     EpollPoller poller;
     g_poller = &poller;
-
+    // ====================== 这里插入上面定时器代码 ======================
+    TimerQueue timer_queue(g_poller);
+    timer_queue.addTimer([](){
+        int online = g_online_conn.load();
+        int q_len  = (int)business_queue.size();
+        LOG_I("[TIMER MONITOR] online=%d, business_queue=%d", online, q_len);
+    }, 3.0, 3.0);
     // 初始化 wakeup eventfd
     g_wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     assert(g_wakeup_fd >=0);
@@ -1270,7 +1161,7 @@ int main()
             double qps = calc_qps(last_msg_cnt, curr_msg, (int)dur.count());
             int online = g_online_conn.load();
             int q_len  = (int)business_queue.size();
-            LOG_I("[MONITOR] online_conn=%d, msg_qps=%.2f, business_queue_len=%d, queue_max=%d",
+            LOG_I("dklfslf[MONITOR] online_conn=%d, msg_qps=%.2f, business_queue_len=%d, queue_max=%d",
                   online, qps, q_len, QUEUE_MAX_SIZE);
             last_msg_cnt = curr_msg;
             g_last_stat_print = now;
