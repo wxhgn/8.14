@@ -48,12 +48,17 @@ std::chrono::steady_clock::time_point TimerQueue::now()
 {
     return std::chrono::steady_clock::now();
 }
-
+//timespec 秒加纳秒
 struct timespec TimerQueue::howMuchTimeFromNow(std::chrono::steady_clock::time_point expire)
 {
-    auto diff = expire - now();
-    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(diff).count();
-    if (ns < 1000000) ns = 1000000;
+    
+    auto duration=expire.time_since_epoch();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    if(ns<0){
+        ns=0;
+    } else if (ns < 1000000) {
+        ns = 1000000;
+    }//兜底保护：如果剩余时间太短，强制改成1毫秒
     struct timespec ts;
     ts.tv_sec = ns / 1000000000L;
     ts.tv_nsec = ns % 1000000000L;
@@ -63,10 +68,11 @@ struct timespec TimerQueue::howMuchTimeFromNow(std::chrono::steady_clock::time_p
 void TimerQueue::resetTimerfd(std::chrono::steady_clock::time_point expire)
 {
     struct itimerspec newValue;
-    struct itimerspec oldValue;
-    memset(&newValue, 0, sizeof(newValue));
-    newValue.it_value = howMuchTimeFromNow(expire);
-    int ret = timerfd_settime(timerfd_, 0, &newValue, &oldValue);
+    //it_interval:唤醒之后，隔多久再自动重复触发；
+    //我们这里置0，只触发一次，不是内核自动周期定时器
+    memset(&newValue, 0, sizeof(newValue));//把it_interval置0，代表内核只唤醒一次，不会自动循环
+    newValue.it_value = howMuchTimeFromNow(expire);//多久之后唤醒一次
+    int ret = timerfd_settime(timerfd_,TFD_TIMER_ABSTIME, &newValue, nullptr);
     if (ret < 0)
     {
         perror("timerfd_settime");
