@@ -10,11 +10,11 @@
 
 class EpollPoller;
 class Channel;   // 前向声明
-
+class EventLoop;
 class TimerQueue
 {
 public:
-    explicit TimerQueue(EpollPoller* poller);
+    explicit TimerQueue(EventLoop*loop,EpollPoller* poller);
     ~TimerQueue();
 
     void addTimer(TimerCallback cb, double delaySec, bool repeat);
@@ -28,7 +28,7 @@ private:
     int timerfd_;
     EpollPoller* poller_;
     std::unique_ptr<Channel> timer_channel_;   // ★ 新增：绑定 timerfd_ 的 Channel
-
+    EventLoop*loop_;
     using TimerPtr = std::shared_ptr<Timer>;
     std::multimap<std::chrono::steady_clock::time_point, TimerPtr> timers_;
    

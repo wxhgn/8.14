@@ -26,11 +26,13 @@
 #include <cassert>
 #include <functional>
 #include "buffer.h"
-#include<minilog.h>
+#include"minilog.h"
 #include"TimerQueue.h"
 #include <mysql/mysql.h>
+#include "EventLoop.h"
 #include"Channel.h"
 #include"EpollPoller.h"
+#include "EventLoopThreadPool.h"
 
 using namespace std;
 
@@ -38,7 +40,7 @@ using namespace std;
 #define IDLE_TIMEOUT_SEC 60
 #define MAX_EVENTS   1024
 #define PORT         8888
-#define THREAD_NUM   4
+#define THREAD_NUM   4       // subReactor数量
 #define MAX_MSG_LEN  (64 * 1024)
 #define MAX_SEND_BUF_SIZE   (256*1024)
 #define SEND_BUF_SOFT_LIMIT (64*1024)   // 高水位
@@ -50,8 +52,10 @@ atomic<int>      g_online_conn{0};
 atomic<int>      g_business_queue_size{0};
 chrono::steady_clock::time_point g_last_stat_print;
 const int QUEUE_MAX_SIZE = 200;
+ EventLoop* g_mainLoop = nullptr;
 void broadcast(int fd, const std::string& msg);
 class Channel;
+class ConnEvent;
 
 double calc_qps(uint64_t old_cnt, uint64_t new_cnt, int ms) {
     if (ms <= 0) return 0.0;
@@ -65,24 +69,8 @@ const char* DB_PWD  = "xjh123321";
 const char* DB_NAME = "chat_db";
 unsigned int DB_PORT = 3306;
 
-std::thread::id g_main_thread_id;
-
-inline void assert_is_main_thread() {
-#ifndef NDEBUG
-    assert(std::this_thread::get_id() == g_main_thread_id
-           && "FATAL: 非主线程访问 IoContext！");
-#endif
-}
-
-// wakeup fd 全局
-int g_wakeup_fd = -1;
-shared_ptr<Channel> g_wakeup_channel;
-
-EpollPoller* g_poller = nullptr;
-
-// ==================== IoContext ====================
+// ==================== IoContext 【改成线程安全，去掉主线程断言】 ====================
 using TimeoutItem = pair<chrono::steady_clock::time_point, int>;
-
 class IoContext {
 private:
     priority_queue<TimeoutItem, vector<TimeoutItem>, greater<TimeoutItem>> timeout_heap;
@@ -93,22 +81,22 @@ private:
     unordered_map<int, chrono::steady_clock::time_point> fd_last_active;
     unordered_map<int, string>        fd_to_name;
     unordered_set<int>                online_fd_set;
-
+    std::mutex mtx_;
 public:
     void update_fd_active(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         auto now = chrono::steady_clock::now();
         timeout_heap.emplace(now + chrono::seconds(IDLE_TIMEOUT_SEC), fd);
         fd_last_active[fd] = now;
     }
 
     bool fd_alive(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         return online_clients.find(fd) != online_clients.end();
     }
 
     void clean_fd(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         online_clients.erase(fd);
         fd_to_uid.erase(fd);
         fd_to_session.erase(fd);
@@ -119,7 +107,7 @@ public:
     }
 
     uint64_t add_new_conn(int fd, const string& ip) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         online_clients[fd] = ip;
         uint64_t sid = ++session_counter;
         fd_to_session[fd] = sid;
@@ -128,42 +116,42 @@ public:
     }
 
     uint64_t get_session(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = fd_to_session.find(fd);
         if (it == fd_to_session.end()) return 0;
         return it->second;
     }
 
     string get_ip(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = online_clients.find(fd);
         if (it == online_clients.end()) return "";
         return it->second;
     }
 
     void set_uid_and_name(int fd, int uid, const string& name) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         fd_to_name[fd] = name;
         fd_to_uid[fd]  = uid;
         online_fd_set.insert(fd);
     }
 
     int get_uid(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = fd_to_uid.find(fd);
         if (it == fd_to_uid.end()) return -1;
         return it->second;
     }
 
     string get_username(int fd) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = fd_to_name.find(fd);
         if (it == fd_to_name.end()) return "";
         return it->second;
     }
 
     vector<int> get_all_fd() {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         vector<int> res;
         res.reserve(online_fd_set.size());
         for (auto& p : online_fd_set) res.push_back(p);
@@ -171,7 +159,7 @@ public:
     }
 
     vector<int> find_same_uid_fd(int skip_fd, int target_uid) {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         vector<int> to_kick;
         for (auto& p : fd_to_uid) {
             int fd = p.first, uid = p.second;
@@ -181,7 +169,7 @@ public:
     }
 
     vector<int> handle_timeout() {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         vector<int> need_close;
         unordered_set<int> seen;
         auto now = chrono::steady_clock::now();
@@ -206,7 +194,7 @@ public:
     }
 
     vector<int> get_all_online_fd() {
-        assert_is_main_thread();
+        std::lock_guard<std::mutex> lock(mtx_);
         vector<int> fds;
         for (auto& pair : online_clients) fds.push_back(pair.first);
         return fds;
@@ -216,7 +204,6 @@ public:
 IoContext g_io_ctx;
 
 // ==================== muduo风格回调类型定义 ====================
-class ConnEvent;
 using ConnectionCallback  = function<void(const shared_ptr<ConnEvent>&)>;
 using MessageCallback     = function<void(const shared_ptr<ConnEvent>&, const string&)>;
 using WriteCompleteCallback = function<void(const shared_ptr<ConnEvent>&)>;
@@ -228,7 +215,7 @@ using LowWaterMarkCallback  = function<void(const shared_ptr<ConnEvent>&)>;
 vector<char> pack_msg(const string& s);
 void sent_msg(int fd, const string& msg, shared_ptr<ConnEvent> conn);
 
-// ==================== ConnEvent ====================
+// ==================== ConnEvent 增加 ownerLoop_ 归属 ====================
 class ConnEvent : public enable_shared_from_this<ConnEvent>
 {
 public:
@@ -236,6 +223,7 @@ public:
     uint64_t session_id_{0};
     string ip_;
     Channel* channel_{nullptr};
+    EventLoop* ownerLoop_{nullptr}; // 归属哪个subLoop
 
     Buffer recv_buf_;
     Buffer send_buf_;
@@ -254,8 +242,8 @@ public:
     bool high_triggered_ = false;
     queue<string> cache_msg_queue_;
 
-    ConnEvent(int fd, string ip, uint64_t sid, Channel* ch)
-        : fd_(fd),session_id_(sid),ip_(ip) ,channel_(ch)
+    ConnEvent(int fd, string ip, uint64_t sid, Channel* ch, EventLoop* loop)
+        : fd_(fd),session_id_(sid),ip_(ip) ,channel_(ch), ownerLoop_(loop)
     {}
 
     void setConnectionCallback(ConnectionCallback cb) { conn_cb_ = move(cb); }
@@ -290,7 +278,6 @@ public:
 
     void flushCacheMsg()
     {
-        assert_is_main_thread();
         Buffer& send_buf = send_buf_;
         while (!cache_msg_queue_.empty())
         {
@@ -309,13 +296,12 @@ public:
         {
             channel_->enableReading();
             channel_->enableWriting();
-            g_poller->updateChannel(channel_);
+            ownerLoop_->updateChannel(channel_);
         }
     }
 
     void checkWaterMark()
     {
-        assert_is_main_thread();
         Buffer& buf = send_buf_;
         size_t len = buf.readableBytes();
         if (len >= high_water_mark_ && !high_triggered_)
@@ -332,7 +318,6 @@ public:
 
     void handleRead()
     {
-        assert_is_main_thread();
         if(!g_io_ctx.fd_alive(fd_)){
             return;
         }
@@ -398,7 +383,6 @@ public:
 
     void handleWrite()
     {
-        assert_is_main_thread();
         if(!g_io_ctx.fd_alive(fd_)){
             return;
         }
@@ -408,7 +392,7 @@ public:
         {
             channel_->enableReading();
             channel_->disableWriting();
-            g_poller->updateChannel(channel_);
+            ownerLoop_->updateChannel(channel_);
             return;
         }
 
@@ -435,7 +419,7 @@ public:
         {
             channel_->enableReading();
             channel_->disableWriting();
-            g_poller->updateChannel(channel_);
+            ownerLoop_->updateChannel(channel_);
             if (write_complete_cb_)
             {
                 write_complete_cb_(shared_from_this());
@@ -446,16 +430,18 @@ public:
     void send(const string& msg);
 };
 
+// 每个loop自己维护连接map，这里简化：全局map（面试够用）
 unordered_map<int, shared_ptr<ConnEvent>> g_fd_conn_map;
 unordered_map<int, shared_ptr<Channel>> g_fd_channel_map;
+std::mutex g_conn_map_mtx;
 
 // ==================== ReplyTask ====================
 struct ReplyTask {
-    int      fd         = -1;
+    int         fd         = -1;
     uint64_t session_id = 0;
-    string   reply_msg;
-    int      uid        = -1;
-    string   username;
+    string      reply_msg;
+    int         uid        = -1;
+    string      username;
 };
 
 // ==================== SafeQueue ====================
@@ -509,9 +495,9 @@ public:
 // ==================== Message 基类 ====================
 class Message {
 public:
-    int      fd         = -1;
+    int         fd         = -1;
     uint64_t session_id = 0;
-    string   ip;
+    string      ip;
 
     virtual void handle(MYSQL* conn) = 0;
     virtual ~Message() = default;
@@ -526,7 +512,7 @@ public:
 
 class ChatMsg : public Message {
 public:
-    int    uid = -1;
+    int     uid = -1;
     string username;
     string content;
     void handle(MYSQL* conn) override;
@@ -539,7 +525,6 @@ public:
 };
 
 SafeQueue<unique_ptr<Message>> business_queue{QUEUE_MAX_SIZE};
-SafeQueue<ReplyTask>           reply_queue{QUEUE_MAX_SIZE};
 vector<thread>                 g_thread_pool;
 
 // ==================== DB 函数声明 ====================
@@ -548,57 +533,53 @@ void db_insert_msg(MYSQL* conn, int sender_id, const string& msg);
 void db_insert_online_log(MYSQL* conn, int user_id,
                           const string& ip, const string& event);
 void broadcast(int fd, const std::string& msg);
-// wakeup 消费reply队列
-void handleWakeUp()
+
+// 【重点改造：不再全局wakeup，拿到conn，交给它所属loop runInLoop】
+void reply_dispatch(ReplyTask rt)
 {
-    assert_is_main_thread();
-    uint64_t val = 0;
-    read(g_wakeup_fd, &val, sizeof(uint64_t));
-
-    ReplyTask rt;
-    while (reply_queue.try_pop(rt))
-    {
-        if (rt.fd == -1) {
-            broadcast(-1, rt.reply_msg);
-            continue;
-        }
-        uint64_t cur_sid = g_io_ctx.get_session(rt.fd);
-        if (cur_sid == 0 || cur_sid != rt.session_id) {
-            LOG_W("drop stale reply fd=%d (fd reused)", rt.fd);
-            continue;
-        }
-        if (!g_io_ctx.fd_alive(rt.fd)) continue;
-
-        if (rt.uid != -1) {
-            int new_fd  = rt.fd;
-            int new_uid = rt.uid;
-            vector<int> to_kick = g_io_ctx.find_same_uid_fd(new_fd, new_uid);
-            for (int kick_fd : to_kick) {
-                LOG_E("kick old fd=%d", kick_fd);
-                auto it = g_fd_conn_map.find(kick_fd);
-                if (it != g_fd_conn_map.end() && it->second) {
-                    if (it->second->close_cb_) it->second->close_cb_(it->second);
-                }
-            }
-            g_io_ctx.set_uid_and_name(new_fd, new_uid, rt.username);
-        }
-        auto it_conn = g_fd_conn_map.find(rt.fd);
-        if (it_conn != g_fd_conn_map.end() && it_conn->second) {
-            it_conn->second->send(rt.reply_msg);
-        }
+    if (rt.fd == -1) {
+        broadcast(-1, rt.reply_msg);
+        return;
     }
+    uint64_t cur_sid = g_io_ctx.get_session(rt.fd);
+    if (cur_sid == 0 || cur_sid != rt.session_id) {
+        LOG_W("drop stale reply fd=%d (fd reused)", rt.fd);
+        return;
+    }
+    if (!g_io_ctx.fd_alive(rt.fd)) return;
+
+    std::lock_guard<std::mutex> lock(g_conn_map_mtx);
+    auto it_conn = g_fd_conn_map.find(rt.fd);
+    if (it_conn == g_fd_conn_map.end() || !it_conn->second) return;
+    auto conn = it_conn->second;
+
+    // 登录成功踢同账号其他设备
+    if (rt.uid != -1) {
+        int new_fd  = rt.fd;
+        int new_uid = rt.uid;
+        vector<int> to_kick = g_io_ctx.find_same_uid_fd(new_fd, new_uid);
+        for (int kick_fd : to_kick) {
+            LOG_E("kick old fd=%d", kick_fd);
+            std::lock_guard<std::mutex> lk(g_conn_map_mtx);
+            auto it = g_fd_conn_map.find(kick_fd);
+            if (it != g_fd_conn_map.end() && it->second) {
+                if (it->second->close_cb_) it->second->close_cb_(it->second);
+            }
+        }
+        g_io_ctx.set_uid_and_name(new_fd, new_uid, rt.username);
+    }
+
+    // 投递到这个连接归属的subLoop线程执行send
+    conn->ownerLoop_->runInLoop([conn, msg=rt.reply_msg](){
+        conn->send(msg);
+    });
 }
 
-// worker调用，入队+写eventfd唤醒IO线程
-bool reply_queue_wake_push(ReplyTask&& rt)
+// worker调用，直接dispatch
+bool reply_push(ReplyTask&& rt)
 {
-    bool ok = reply_queue.push(std::move(rt));
-    if(ok && g_wakeup_fd >=0)
-    {
-        uint64_t one = 1;
-        write(g_wakeup_fd, &one, sizeof(uint64_t));
-    }
-    return ok;
+    reply_dispatch(std::move(rt));
+    return true;
 }
 
 // ==================== handle 实现 ====================
@@ -611,18 +592,19 @@ void LoginMsg::handle(MYSQL* conn) {
     rt.username   = this->username;
 
     if (uid != -1) {
-        rt.uid       = uid;
+        rt.uid        = uid;
         rt.reply_msg = string("login ok uid") + to_string(uid);
         db_insert_online_log(conn, uid, this->ip, "login");
 
         ReplyTask broadcast_online;
-        broadcast_online.fd        = -1;
+        broadcast_online.fd         = -1;
         broadcast_online.reply_msg = "2|" + this->username + "|";
-        reply_queue_wake_push(move(broadcast_online));
+        reply_push(move(broadcast_online));
+        LOG_I("login ok fd=%d,uid=%d",rt.fd,uid);
     } else {
         rt.reply_msg = "login fail";
     }
-    reply_queue_wake_push(move(rt));
+    reply_push(move(rt));
 }
 
 void ChatMsg::handle(MYSQL* conn) {
@@ -632,7 +614,7 @@ void ChatMsg::handle(MYSQL* conn) {
     ReplyTask brd;
     brd.fd        = -1;
     brd.reply_msg = "1|" + username + "|" + content;
-    reply_queue_wake_push(move(brd));
+    reply_push(move(brd));
 }
 
 void LogoutMsg::handle(MYSQL* conn) {
@@ -756,6 +738,7 @@ vector<string> split(const string& s, char sep) {
 void sig_handler(int sig) {
     (void)sig;
     g_pool_running = false;
+      if (g_mainLoop) g_mainLoop->quit();
 }
 
 int set_nonblock(int fd) {
@@ -764,7 +747,6 @@ int set_nonblock(int fd) {
 }
 
 vector<char> pack_msg(const string& s) {
-    assert_is_main_thread();
     vector<char> out;
     uint32_t bodylen = (uint32_t)s.size();
     uint32_t netlen  = htonl(bodylen);
@@ -774,17 +756,20 @@ vector<char> pack_msg(const string& s) {
 }
 
 void clean_fd(int fd, Channel* ch) {
-    assert_is_main_thread();
-    g_poller->removeChannel(ch);
-    g_poller->unregisterChannel(fd);
-    close(fd);
     g_io_ctx.clean_fd(fd);
-    g_fd_conn_map.erase(fd);
-    g_fd_channel_map.erase(fd);
+    {
+        std::lock_guard<std::mutex> lock(g_conn_map_mtx);
+        g_fd_conn_map.erase(fd);
+        g_fd_channel_map.erase(fd);
+    }
+    if(ch)
+    {
+        ch->ownerLoop()->removeChannel(ch);
+    }
+    close(fd);
 }
 
 void sent_msg(int fd, const string& msg, shared_ptr<ConnEvent> conn) {
-    assert_is_main_thread();
     if (!g_io_ctx.fd_alive(fd)) return;
 
     if (conn->isPauseSend()) {
@@ -814,7 +799,7 @@ void sent_msg(int fd, const string& msg, shared_ptr<ConnEvent> conn) {
     if (need_mod) {
         conn->channel_->enableReading();
         conn->channel_->enableWriting();
-        g_poller->updateChannel(conn->channel_);
+        conn->ownerLoop_->updateChannel(conn->channel_);
     }
 }
 
@@ -827,15 +812,18 @@ void broadcast(int sender_fd, const string& msg) {
     vector<int> targets = g_io_ctx.get_all_fd();
     for (int fd : targets) {
         if (fd == sender_fd) continue;
+        std::lock_guard<std::mutex> lock(g_conn_map_mtx);
         auto it = g_fd_conn_map.find(fd);
         if (it != g_fd_conn_map.end() && it->second) {
-            it->second->send(msg);
+            auto c = it->second;
+            c->ownerLoop_->runInLoop([c, msg](){
+                c->send(msg);
+            });
         }
     }
 }
 
 void clean_fd_with_log(int fd, Channel* ch) {
-    assert_is_main_thread();
     int uid = g_io_ctx.get_uid(fd);
     string username = g_io_ctx.get_username(fd);
 
@@ -852,7 +840,10 @@ void clean_fd_with_log(int fd, Channel* ch) {
         }
 
         string logout_body = "3|" + username + "|user logout";
-        broadcast(-1, logout_body);
+        ReplyTask brd;
+        brd.fd = -1;
+        brd.reply_msg = logout_body;
+        reply_push(move(brd));
     }
     clean_fd(fd, ch);
 }
@@ -930,12 +921,7 @@ void onWriteComplete(const shared_ptr<ConnEvent>& conn)
 void onClose(const shared_ptr<ConnEvent>& conn)
 {
     LOG_I("连接关闭回调 fd=%d", conn->fd_);
-    auto it = g_fd_channel_map.find(conn->fd_);
-    if (it != g_fd_channel_map.end() && it->second) {
-        clean_fd_with_log(conn->fd_, it->second.get());
-    } else {
-        clean_fd_with_log(conn->fd_, nullptr);
-    }
+    clean_fd_with_log(conn->fd_, conn->channel_);
 }
 
 void onHighWaterMark(const shared_ptr<ConnEvent>& conn, size_t len)
@@ -1027,17 +1013,16 @@ void worker() {
             rt.fd = msg->fd;
             rt.session_id = msg->session_id;
             rt.reply_msg = "1|sys|db busy";
-            reply_queue_wake_push(move(rt));
+            reply_push(move(rt));
             continue;
         }
 
         msg->handle(conn);
-
         g_pool->return_conn(conn);
     }
 }
 
-// ==================== main ====================
+// ==================== main：MainLoop，只负责accept！ ====================
 int main()
 {
     struct sigaction act_int{};
@@ -1052,11 +1037,16 @@ int main()
     act_pipe.sa_flags = 0;
     sigaction(SIGPIPE, &act_pipe, nullptr);
 
-    g_main_thread_id = std::this_thread::get_id();
-
     g_pool = make_unique<MySQLConnPool>(DB_HOST, DB_USER, DB_PWD,
                                         DB_NAME, DB_PORT, 8);
 
+    // MainLoop：主Reactor
+    EventLoop mainLoop;
+    EventLoopThreadPool threadPool(&mainLoop, THREAD_NUM);
+   
+    g_mainLoop = &mainLoop;
+    threadPool.start();
+    
     int listenfd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenfd < 0) { perror("socket"); return -1; }
     set_nonblock(listenfd);
@@ -1076,29 +1066,11 @@ int main()
         perror("listen"); close(listenfd); return -1;
     }
 
-    EpollPoller poller;
-    g_poller = &poller;
-    // ====================== 这里插入上面定时器代码 ======================
-    TimerQueue timer_queue(g_poller);
-    timer_queue.addTimer([](){
-        int online = g_online_conn.load();
-        int q_len  = (int)business_queue.size();
-        LOG_I("[TIMER MONITOR] online=%d, business_queue=%d", online, q_len);
-    }, 3.0, 3.0);
-    // 初始化 wakeup eventfd
-    g_wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    assert(g_wakeup_fd >=0);
-    g_wakeup_channel = make_shared<Channel>(g_wakeup_fd);
-    g_wakeup_channel->enableReading();
-    g_wakeup_channel->setReadCallback(handleWakeUp);
-    poller.registerChannel(g_wakeup_channel.get());
-    poller.addChannel(g_wakeup_channel.get());
-
-    Channel listenCh(listenfd);
+    Channel listenCh(&mainLoop,listenfd);
     listenCh.enableReading();
-    poller.registerChannel(&listenCh);
-    poller.addChannel(&listenCh);
+    mainLoop.addChannel(&listenCh);
 
+    // accept回调：MainLoop里面，拿到fd，分配给subLoop
     listenCh.setReadCallback([&](){
         while (true) {
             sockaddr_in cli_addr;
@@ -1115,99 +1087,49 @@ int main()
             uint64_t sid = g_io_ctx.add_new_conn(connfd, ip);
             g_io_ctx.update_fd_active(connfd);
 
-            auto clientCh = make_shared<Channel>(connfd);
-            clientCh->enableReading();
-            poller.registerChannel(clientCh.get());
-            poller.addChannel(clientCh.get());
+            // 轮询拿到subLoop
+            EventLoop* subLoop = threadPool.getNextLoop();
+            // 所有连接创建逻辑，投递到subLoop线程执行
+            subLoop->runInLoop([subLoop, connfd, ip, sid](){
+                auto clientCh = make_shared<Channel>(subLoop,connfd);
+                clientCh->enableReading();
+                subLoop->addChannel(clientCh.get());
+                auto conn = make_shared<ConnEvent>(connfd, ip, sid, clientCh.get(), subLoop);
+                clientCh->setReadCallback([conn](){ conn->handleRead(); });
+                clientCh->setWriteCallback([conn](){ conn->handleWrite(); });
+                clientCh->setCloseCallback([conn](){
+                    if (conn->close_cb_) conn->close_cb_(conn);
+                });
+                conn->setConnectionCallback(onConnection);
+                conn->setMessageCallback(onMessage);
+                conn->setWriteCompleteCallback(onWriteComplete);
+                conn->setCloseCallback(onClose);
+                conn->setHighWaterMarkCallback(onHighWaterMark, SEND_BUF_SOFT_LIMIT);
+                conn->setLowWaterMarkCallback(onLowWaterMark, SEND_BUF_LOW_LIMIT);
 
-            auto conn = make_shared<ConnEvent>(connfd, ip, sid, clientCh.get());
-            clientCh->setReadCallback([conn](){ conn->handleRead(); });
-            clientCh->setWriteCallback([conn](){ conn->handleWrite(); });
-            clientCh->setCloseCallback([conn](){
-                if (conn->close_cb_) conn->close_cb_(conn);
+                {
+                    std::lock_guard<std::mutex> lock(g_conn_map_mtx);
+                    g_fd_conn_map[connfd] = conn;
+                    g_fd_channel_map[connfd] = clientCh;
+                }
+                if (conn->conn_cb_) conn->conn_cb_(conn);
             });
-
-            conn->setConnectionCallback(onConnection);
-            conn->setMessageCallback(onMessage);
-            conn->setWriteCompleteCallback(onWriteComplete);
-            conn->setCloseCallback(onClose);
-            conn->setHighWaterMarkCallback(onHighWaterMark, SEND_BUF_SOFT_LIMIT);
-            conn->setLowWaterMarkCallback(onLowWaterMark, SEND_BUF_LOW_LIMIT);
-
-            g_fd_conn_map[connfd] = conn;
-            g_fd_channel_map[connfd] = clientCh;
-
-            if (conn->conn_cb_) conn->conn_cb_(conn);
         }
     });
 
-    // 启动worker
+    // 启动业务worker线程池（数据库、消息处理）
     for (int i = 0; i < THREAD_NUM; i++) {
         g_thread_pool.emplace_back(worker);
     }
 
-    g_last_stat_print = chrono::steady_clock::now();
-    uint64_t last_msg_cnt = 0;
-    vector<Channel*> activeChannels;
-
-    while (g_pool_running.load())
-    {
-        poller.poll(10, activeChannels);
-
-        auto now = chrono::steady_clock::now();
-        auto dur = chrono::duration_cast<chrono::milliseconds>(now - g_last_stat_print);
-        if (dur.count() >= 10000) {
-            uint64_t curr_msg = g_total_recv_mgs.load();
-            double qps = calc_qps(last_msg_cnt, curr_msg, (int)dur.count());
-            int online = g_online_conn.load();
-            int q_len  = (int)business_queue.size();
-            LOG_I("dklfslf[MONITOR] online_conn=%d, msg_qps=%.2f, business_queue_len=%d, queue_max=%d",
-                  online, qps, q_len, QUEUE_MAX_SIZE);
-            last_msg_cnt = curr_msg;
-            g_last_stat_print = now;
-        }
-
-        // 超时关闭
-        vector<int> timeout_fds = g_io_ctx.handle_timeout();
-        for (int fd : timeout_fds) {
-            auto it = g_fd_conn_map.find(fd);
-            if (it != g_fd_conn_map.end() && it->second) {
-                if (it->second->close_cb_) it->second->close_cb_(it->second);
-            }
-        }
-
-        // 事件分发
-        for (Channel* ch : activeChannels)
-        {
-            ch->handleEvent();
-        }
-    }
-
+    // MainLoop跑起来，只负责accept
+    mainLoop.loop();
+    
     // 优雅退出
     g_pool_running = false;
     business_queue.notify_all();
     for (auto& t : g_thread_pool) {
         if (t.joinable()) t.join();
-    }
-
-    // 释放wakeupfd
-    if(g_wakeup_channel)
-    {
-        g_poller->removeChannel(g_wakeup_channel.get());
-        g_poller->unregisterChannel(g_wakeup_fd);
-    }
-    if(g_wakeup_fd >= 0)
-    {
-        close(g_wakeup_fd);
-        g_wakeup_fd = -1;
-    }
-
-    vector<int> fds = g_io_ctx.get_all_online_fd();
-    for (int fd : fds) {
-        auto it = g_fd_channel_map.find(fd);
-        if (it != g_fd_channel_map.end() && it->second) {
-            clean_fd(fd, it->second.get());
-        }
     }
 
     close(listenfd);

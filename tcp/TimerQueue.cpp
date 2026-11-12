@@ -21,28 +21,26 @@ int createTimerfd()
 }
 
 
-TimerQueue::TimerQueue(EpollPoller* poller)
+TimerQueue::TimerQueue(EventLoop*loop,EpollPoller* poller)
     : timerfd_(createTimerfd())
+    ,loop_(loop)
     , poller_(poller)
 {
     // ★ 注册 timerfd 到 epoll
-    timer_channel_ = std::make_unique<Channel>(timerfd_);
+    timer_channel_ = std::make_unique<Channel>(loop_,timerfd_);
     timer_channel_->enableReading();
     timer_channel_->setReadCallback([this]() { handleRead(); });
     poller_->registerChannel(timer_channel_.get());
     poller_->addChannel(timer_channel_.get());
 }
 
-TimerQueue::~TimerQueue()
-{
-    if (timer_channel_)
-    {
-        poller_->removeChannel(timer_channel_.get());
-        poller_->unregisterChannel(timerfd_);
+TimerQueue::~TimerQueue() {
+    if (timer_channel_) {
+        poller_->removeChannel(timer_channel_.get());   // ★ poller_ 已 delete
+        poller_->unregisterChannel(timerfd_);            // ★ use-after-free
     }
     close(timerfd_);
 }
-
 // ... 其他不变 ...
 std::chrono::steady_clock::time_point TimerQueue::now()
 {

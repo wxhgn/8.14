@@ -3,7 +3,7 @@
 
 #include <sys/epoll.h>
 #include <functional>
-
+class EventLoop;
 class Channel
 {
 public:
@@ -12,7 +12,8 @@ public:
     using CloseCallback = std::function<void()>;
     using ErrorCallback = std::function<void()>;
 
-    Channel(int fd) : fd_(fd), events_(0), revents_(0) {}
+    Channel(EventLoop* loop,int fd) : fd_(fd),events_(0), revents_(0),ownerLoop_(loop) {}
+  
 
     int fd() const { return fd_; }
     uint32_t events() const { return events_; }
@@ -41,7 +42,7 @@ public:
         if (revents_ & EPOLLIN)  { if (read_cb_)  read_cb_();  }
         if (revents_ & EPOLLOUT) { if (write_cb_) write_cb_(); }
     }
-
+EventLoop*ownerLoop()const{return ownerLoop_;}
 private:
     int fd_;
     uint32_t events_;
@@ -50,6 +51,7 @@ private:
     WriteCallback write_cb_;
     CloseCallback close_cb_;
     ErrorCallback error_cb_;
+    EventLoop* ownerLoop_;
 };
 
 #endif
