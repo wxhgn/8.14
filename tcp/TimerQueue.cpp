@@ -23,8 +23,8 @@ int createTimerfd()
 
 TimerQueue::TimerQueue(EventLoop*loop,EpollPoller* poller)
     : timerfd_(createTimerfd())
-    ,loop_(loop)
     , poller_(poller)
+    ,loop_(loop)
 {
     // ★ 注册 timerfd 到 epoll
     timer_channel_ = std::make_unique<Channel>(loop_,timerfd_);

@@ -46,3 +46,32 @@ EventLoopThreadPool::~EventLoopThreadPool()
 
     // ③ subLoops_ 析构，unique_ptr 自动 delete 每个 EventLoop
 }
+/*Ctrl+C
+  → 内核调用 sig_handler
+      → g_pool_running = false
+      → g_mainLoop->quit()
+          → quit_ = true
+          → running_ = false
+          → wakeup() 写 eventfd
+  → epoll_wait 返回（被 eventfd 唤醒 或 被 SIGINT 打断返回 EINTR）
+  → EpollPoller::poll 返回
+  → EventLoop::loop 检查 running_ == false，退出
+  → main 继续
+      → g_pool_running = false
+      → business_queue.notify_all()
+      → g_thread_pool.join()   ← worker 处理完当前 msg 后退出
+      → close(listenfd)
+      → g_pool.reset()
+      → return 0
+          → threadPool 析构
+              → for (loop : subLoopPtrs_) loop->quit()
+                  → quit_ = true
+                  → running_ = false
+                  → wakeup()
+              → subLoop 的 epoll_wait 返回，loop 退出
+              → join 成功
+          → subLoops_ 析构，unique_ptr delete EventLoop
+          → mainLoop 析构
+              → delete timerQueue_   ← 先
+              → delete poller_       ← 后
+          → return 0*/

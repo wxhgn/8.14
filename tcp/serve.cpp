@@ -318,6 +318,7 @@ public:
 
     void handleRead()
     {
+         if (ownerLoop_->isQuit()) return; 
         if(!g_io_ctx.fd_alive(fd_)){
             return;
         }
@@ -350,6 +351,7 @@ public:
 
         while (recv_buf.readableBytes() >= 4)
         {
+             if (ownerLoop_->isQuit()) break;   
             uint32_t net_len;
             ::memcpy(&net_len, recv_buf.peek(), 4);
             uint32_t body_len = ntohl(net_len);
@@ -383,6 +385,7 @@ public:
 
     void handleWrite()
     {
+         if (ownerLoop_->isQuit()) return; 
         if(!g_io_ctx.fd_alive(fd_)){
             return;
         }
@@ -399,6 +402,7 @@ public:
         bool closed = false;
         while (buf.readableBytes() > 0)
         {
+                if (ownerLoop_->isQuit()) break;   // ★ 检查退出标志
             int ret = ::send(fd_, buf.peek(), buf.readableBytes(), MSG_NOSIGNAL);
             if (ret < 0)
             {
@@ -524,6 +528,15 @@ public:
     void handle(MYSQL* conn) override;
 };
 
+class PrivateChatMsg:public Message{
+    public:
+    int sender_uid=-1;
+    string sender_name;
+    int target_uid=-1;
+    string content;
+    void handle(MYSQL*conn)override;
+};
+
 SafeQueue<unique_ptr<Message>> business_queue{QUEUE_MAX_SIZE};
 vector<thread>                 g_thread_pool;
 
@@ -636,6 +649,10 @@ private:
     MYSQL* create_new_conn() {
         MYSQL* conn = mysql_init(nullptr);
         if (!conn) { LOG_E("mysql_init fail"); return nullptr; }
+          unsigned int timeout_sec = 5;
+    mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_sec);
+    mysql_options(conn, MYSQL_OPT_READ_TIMEOUT,    &timeout_sec);
+    mysql_options(conn, MYSQL_OPT_WRITE_TIMEOUT,   &timeout_sec);
         if (!mysql_real_connect(conn, m_host.c_str(), m_user.c_str(),
                                 m_pwd.c_str(), m_db.c_str(),
                                 m_port, nullptr, 0)) {
@@ -1016,7 +1033,7 @@ void worker() {
             reply_push(move(rt));
             continue;
         }
-
+        
         msg->handle(conn);
         g_pool->return_conn(conn);
     }
@@ -1028,7 +1045,7 @@ int main()
     struct sigaction act_int{};
     act_int.sa_handler = sig_handler;
     sigemptyset(&act_int.sa_mask);
-    act_int.sa_flags = SA_RESTART;
+    act_int.sa_flags = 0;
     sigaction(SIGINT, &act_int, nullptr);
 
     struct sigaction act_pipe{};
@@ -1080,6 +1097,7 @@ int main()
                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (connfd == -1) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                 if (errno == EINTR) break;
                 perror("accept");
                 break;
             }

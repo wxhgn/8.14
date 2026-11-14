@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <cassert>
 #include <vector>
+#include <cerrno>     // ★ 加：errno、EINTR
+#include <cstdio>  
 #include <unordered_map>
 
 #define MAX_EVENTS 1024
@@ -48,10 +50,14 @@ public:
     }
 
     void poll(int timeoutMs, std::vector<Channel*>& activeChannels)
-    {
-        activeChannels.clear();
-        struct epoll_event evs[MAX_EVENTS];
-        int n = epoll_wait(epfd_, evs, MAX_EVENTS, timeoutMs);
+    { activeChannels.clear();
+    struct epoll_event evs[MAX_EVENTS];
+    int n = epoll_wait(epfd_, evs, MAX_EVENTS, timeoutMs);
+    if (n < 0) {
+        if (errno == EINTR) return;   // ★ 被信号打断，正常返回，让 loop 检查 running_
+        perror("epoll_wait");
+        return;
+    }
         for (int i = 0; i < n; ++i)
         {
             int fd = evs[i].data.fd;

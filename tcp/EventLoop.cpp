@@ -106,10 +106,35 @@ void EventLoop::loop()
  
     }
 }
+//你代码不把这一批事件处理完、不跑完 doPendingTasks，**不会回到 epoll_wait**。
+/* void poll(int timeoutMs, std::vector<Channel*>& activeChannels)
+    { activeChannels.clear();
+    struct epoll_event evs[MAX_EVENTS];
+    int n = epoll_wait(epfd_, evs, MAX_EVENTS, timeoutMs);
+    if (n < 0) {
+        if (errno == EINTR) return;   // ★ 被信号打断，正常返回，让 loop 检查 running_
+        perror("epoll_wait");
+        return;
+    }
+        for (int i = 0; i < n; ++i)
+        {
+            int fd = evs[i].data.fd;
+            uint32_t rev = evs[i].events;
+            auto it = fd2chan_.find(fd);
+            if (it != fd2chan_.end())
+            {
+                it->second->set_revents(rev);
+                activeChannels.push_back(it->second);
+            }
+        }
+    }
+        SA_RESTART 告诉内核"信号处理函数返回后，被中断的系统调用自动重启"。
+        epoll_wait 被 SIGINT 打断后自动重启，不会返回 -1, EINTR，主循环感知不到信号。
+        去掉后，epoll_wait 返回 -1，errno = EINTR，主循环能感知。*/
 
 void EventLoop::quit()
 {
+    quit_=true;
     running_ = false;
-
     wakeup();
 }

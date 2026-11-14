@@ -9,7 +9,7 @@
 #include <cassert>
 #include <sys/eventfd.h>
 #include <unistd.h>
-
+#include<atomic>
 class Channel;
 class EpollPoller;
 class TimerQueue;
@@ -18,7 +18,7 @@ class EventLoop
 {
 public:
     using Functor = std::function<void()>;
-
+ bool isQuit() const { return quit_.load(); }
     EventLoop();
     ~EventLoop();
 
@@ -43,7 +43,7 @@ private:
 
     std::mutex mutex_;
     std::vector<Functor> pendingFunctors_;
-
+      std::atomic<bool> quit_{false};
     EpollPoller* poller_;
     TimerQueue* timerQueue_;
 };
