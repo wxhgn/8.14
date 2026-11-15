@@ -564,9 +564,17 @@ vector<thread>                 g_thread_pool;
 
 // ==================== DB 函数声明 ====================
 int  db_login(MYSQL* conn, const string& req);
-void db_insert_msg(MYSQL* conn, int sender_id, const string& msg);
+void db_insert_msg(MYSQL* conn, int sender_id,int target_id,int msg_type, const string& msg,int is_read);
 void db_insert_online_log(MYSQL* conn, int user_id,
                           const string& ip, const string& event);
+struct OfflineMsg{
+    int sender_uid;
+    string sender_name;
+    string content;
+    string send_time;
+};                       
+vector<OfflineMsg> db_load_offline_msgs(MYSQL* conn, int target_uid);
+void db_mark_msgs_read(MYSQL* conn, int target_uid);
 void broadcast(int fd, const std::string& msg);
 
 // 【重点改造：不再全局wakeup，拿到conn，交给它所属loop runInLoop】
@@ -638,6 +646,16 @@ void LoginMsg::handle(MYSQL* conn) {
         broadcast_online.reply_msg = "2|" + this->username + "|"+"online";
         reply_push(move(broadcast_online));
         LOG_I("login ok fd=%d,uid=%d",rt.fd,uid);
+        auto offline_msgs=db_load_offline_msgs(conn,uid);
+        for(auto&m:offline_msgs){
+            ReplyTask off_rt;
+            off_rt.fd=this->fd;
+            off_rt.session_id=this->session_id;
+            off_rt.reply_msg="6|"+ to_string(m.sender_uid) + "|" +
+                                m.sender_name + "|" + m.content;
+            reply_push(move(off_rt));
+        }
+         db_mark_msgs_read(conn, uid);
     } else {
         rt.reply_msg = "login fail";
     }
@@ -646,7 +664,7 @@ void LoginMsg::handle(MYSQL* conn) {
 
 void ChatMsg::handle(MYSQL* conn) {
     if (uid == -1) return;
-    db_insert_msg(conn, uid, content);
+    db_insert_msg(conn, uid, 0, 1, content,1);
 
     ReplyTask brd;
     brd.fd        = -1;
@@ -663,13 +681,15 @@ void PrivateChatMsg::handle(MYSQL*conn){
     if(sender_uid==-1||target_uid==-1){
         return;
     }
-    db_insert_msg(conn,sender_uid,"[private to "+to_string(target_uid)+"]"+content);
-    int tfd=g_io_ctx.find_fds_by_uid(target_uid);
+ int tfd  = g_io_ctx.find_fds_by_uid(target_uid);
+ int is_read=(tfd!=-1)?1:0;
+    db_insert_msg(conn,sender_uid,target_uid,2,"[private to "+to_string(target_uid)+"]"+content,is_read);
+   
     if(tfd==-1){
         ReplyTask rt;
         rt.fd=fd;
         rt.session_id=session_id;
-        rt.reply_msg="7|sys|user"+to_string(target_uid)+"offline";
+        rt.reply_msg="7|sys|user"+to_string(target_uid)+"offline,saved";
         reply_push(move(rt));
         return;
     }
@@ -1090,14 +1110,15 @@ int db_login(MYSQL* conn, const string& req) {
     return uid;
 }
 
-void db_insert_msg(MYSQL* conn, int sender_id, const string& msg) {
+void db_insert_msg(MYSQL* conn, int sender_id,int target_id,int msg_type,const string& msg,int is_read  ) {
     vector<char> esc(msg.size() * 2 + 1, 0);
     mysql_real_escape_string(conn, esc.data(), msg.c_str(), msg.size());
-
+  
     vector<char> sql(msg.size() * 2 + 256, 0);
     snprintf(sql.data(), sql.size(),
-             "INSERT INTO chat_msg(sender_id,msg) VALUES(%d,'%s')",
-             sender_id, esc.data());
+            "INSERT INTO chat_msg(sender_id,target_id,msg_type,msg,is_read) "
+             "VALUES(%d,%d,%d,'%s',%d)",
+             sender_id, target_id, msg_type, esc.data(), is_read);
     if (mysql_query(conn, sql.data()) != 0) {
         LOG_E("insert msg error: %s", mysql_error(conn));
     }
@@ -1119,6 +1140,46 @@ void db_insert_online_log(MYSQL* conn, int user_id,
     }
 }
 
+
+vector<OfflineMsg>db_load_offline_msgs(MYSQL*conn,int target_uid){
+    vector<OfflineMsg>res;
+    char sql[1024];
+     snprintf(sql, sizeof(sql),
+             "SELECT c.sender_id, u.username, c.msg, c.send_time "
+             "FROM chat_msg c "
+             "LEFT JOIN user u ON c.sender_id = u.id "
+             "WHERE c.target_id=%d AND c.msg_type=2 AND c.is_read=0 "
+             "ORDER BY c.send_time ASC "
+             "LIMIT 1000",
+             target_uid);
+             if(mysql_query(conn,sql)!=0){
+                LOG_E("load offline msgs error: %s",mysql_error(conn));
+                return res;
+             }
+             MYSQL_RES*result=mysql_store_result(conn);
+             if(!result)return res;
+             MYSQL_ROW row;
+             while((row=mysql_fetch_row(result))){
+                OfflineMsg m;
+                  m.sender_uid  = atoi(row[0]);
+        m.sender_name = row[1] ? row[1] : ("uid" + to_string(m.sender_uid));
+        m.content     = row[2] ? row[2] : "";
+        m.send_time   = row[3] ? row[3] : "";
+        res.push_back(m);
+    }
+    mysql_free_result(result);
+    return res;
+}
+void db_mark_msgs_read(MYSQL* conn, int target_uid) {
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "UPDATE chat_msg SET is_read=1 "
+             "WHERE target_id=%d AND msg_type=2 AND is_read=0",
+             target_uid);
+    if (mysql_query(conn, sql) != 0) {
+        LOG_E("mark read error: %s", mysql_error(conn));
+    }
+}
 // ==================== worker ====================
 void worker() {
     while (g_pool_running.load()) {
