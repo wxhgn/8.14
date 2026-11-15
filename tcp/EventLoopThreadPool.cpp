@@ -4,6 +4,9 @@
 EventLoopThreadPool::EventLoopThreadPool(EventLoop* mainLoop, int numThreads)
     : mainLoop_(mainLoop), numThreads_(numThreads), next_(0) {}
 
+ void EventLoopThreadPool::quitAll() {
+    for (auto* loop : subLoopPtrs_) loop->quit();
+}
 void EventLoopThreadPool::start()
 {
     for (int i = 0; i < numThreads_; ++i)

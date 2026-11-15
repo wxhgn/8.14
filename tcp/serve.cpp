@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstring>
+#include<future>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,6 +83,7 @@ private:
     unordered_map<int, string>        fd_to_name;
     unordered_set<int>                online_fd_set;
     std::mutex mtx_;
+    
 public:
     void update_fd_active(int fd) {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -156,8 +158,8 @@ public:
         res.reserve(online_fd_set.size());
         for (auto& p : online_fd_set) res.push_back(p);
         return res;
-    }
-
+    }//登录了的
+   
     vector<int> find_same_uid_fd(int skip_fd, int target_uid) {
         std::lock_guard<std::mutex> lock(mtx_);
         vector<int> to_kick;
@@ -199,6 +201,26 @@ public:
         for (auto& pair : online_clients) fds.push_back(pair.first);
         return fds;
     }
+     int find_fds_by_uid(int target_uid){
+        lock_guard<mutex>lock(mtx_);
+        vector<int>res;
+        for(auto&p:fd_to_uid){
+            if(p.second==target_uid)return p.first;
+        }
+        return -1;
+    }
+    vector<pair<int,string>>get_online_users(){
+        lock_guard<mutex>lock(mtx_);
+        vector<pair<int,string>>res;
+        for(auto&p:fd_to_uid){
+            int fd=p.first;
+            int uid=p.second;
+            auto it=fd_to_name.find(fd);
+            string name=(it!=fd_to_name.end())?it->second:"";
+            res.push_back({uid,name});
+        }
+        return res;
+    }
 };
 
 IoContext g_io_ctx;
@@ -224,7 +246,7 @@ public:
     string ip_;
     Channel* channel_{nullptr};
     EventLoop* ownerLoop_{nullptr}; // 归属哪个subLoop
-
+    
     Buffer recv_buf_;
     Buffer send_buf_;
 
@@ -260,7 +282,7 @@ public:
         low_water_cb_ = move(cb);
         low_water_mark_ = mark;
     }
-
+    
     void pauseSend()
     {
         pause_send_ = true;
@@ -382,7 +404,7 @@ public:
             if (close_cb_) close_cb_(shared_from_this());
         }
     }
-
+ 
     void handleWrite()
     {
          if (ownerLoop_->isQuit()) return; 
@@ -430,7 +452,7 @@ public:
             }
         }
     }
-
+   
     void send(const string& msg);
 };
 
@@ -573,10 +595,12 @@ void reply_dispatch(ReplyTask rt)
         vector<int> to_kick = g_io_ctx.find_same_uid_fd(new_fd, new_uid);
         for (int kick_fd : to_kick) {
             LOG_E("kick old fd=%d", kick_fd);
-            std::lock_guard<std::mutex> lk(g_conn_map_mtx);
             auto it = g_fd_conn_map.find(kick_fd);
             if (it != g_fd_conn_map.end() && it->second) {
-                if (it->second->close_cb_) it->second->close_cb_(it->second);
+                auto kick_conn=it->second;
+                kick_conn->ownerLoop_->runInLoop([kick_conn](){
+                if (kick_conn->close_cb_) kick_conn->close_cb_(kick_conn);
+                });
             }
         }
         g_io_ctx.set_uid_and_name(new_fd, new_uid, rt.username);
@@ -611,7 +635,7 @@ void LoginMsg::handle(MYSQL* conn) {
 
         ReplyTask broadcast_online;
         broadcast_online.fd         = -1;
-        broadcast_online.reply_msg = "2|" + this->username + "|";
+        broadcast_online.reply_msg = "2|" + this->username + "|"+"online";
         reply_push(move(broadcast_online));
         LOG_I("login ok fd=%d,uid=%d",rt.fd,uid);
     } else {
@@ -635,6 +659,32 @@ void LogoutMsg::handle(MYSQL* conn) {
     db_insert_online_log(conn, uid, ip, "logout");
 }
 
+void PrivateChatMsg::handle(MYSQL*conn){
+    if(sender_uid==-1||target_uid==-1){
+        return;
+    }
+    db_insert_msg(conn,sender_uid,"[private to "+to_string(target_uid)+"]"+content);
+    int tfd=g_io_ctx.find_fds_by_uid(target_uid);
+    if(tfd==-1){
+        ReplyTask rt;
+        rt.fd=fd;
+        rt.session_id=session_id;
+        rt.reply_msg="7|sys|user"+to_string(target_uid)+"offline";
+        reply_push(move(rt));
+        return;
+    }
+    ReplyTask rt;
+    rt.fd=tfd;
+    rt.session_id=g_io_ctx.get_session(tfd);
+    rt.reply_msg="6|"+to_string(sender_uid)+"|"+sender_name+"|"+content;
+    reply_push(move(rt));
+
+    ReplyTask ack;
+    ack.fd=fd;
+    ack.session_id=session_id;
+    ack.reply_msg="7|sys|send to "+to_string(target_uid);
+    reply_push(move(ack));
+}
 // ==================== MySQL 连接池 ====================
 class MySQLConnPool {
 private:
@@ -689,12 +739,16 @@ public:
                 MYSQL* conn = m_conn_queue.front();
                 m_conn_queue.pop();
                 lock.unlock();
-                if (mysql_ping(conn) != 0) {
+                if (mysql_query(conn,"SELECT 1")!= 0) {
                     mysql_close(conn);
                     lock.lock();
-                    m_cur_conn--;
+                     m_cur_conn--;
+                    m_cv.notify_one();
+                   
                     continue;
                 }
+                MYSQL_RES*res=mysql_store_result(conn);
+                if(res)mysql_free_result(res);
                 return conn;
             }
 
@@ -877,13 +931,14 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
     int fd = conn->fd_;
     auto parts = split(pkg, '|');
     if (parts.empty()) return;
-    if(parts.size()<3){
-        conn->send("1|sys|bad format");
-        return;
-    }
+   
     int msg_type = atoi(parts[0].c_str());
 
     if (msg_type == 0) { // 登录
+         if(parts.size()<3){
+        conn->send("1|sys|bad format");
+        return;
+    }
         string user = parts[1];
         string pwd  = parts[2];
 
@@ -902,6 +957,10 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
         g_business_queue_size = (int)business_queue.size();
     }
     else if (msg_type == 1) { // 聊天
+         if(parts.size()<3){
+        conn->send("1|sys|bad format");
+        return;
+    }
         int uid = g_io_ctx.get_uid(fd);
         if (uid != -1) {
             auto task = make_unique<ChatMsg>();
@@ -924,8 +983,54 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
         LOG_I("recv ping fd=%d", fd);
         g_io_ctx.update_fd_active(fd);
         conn->send("5|pong");
+    }else if(msg_type==6){
+         if(parts.size()<3){
+        conn->send("1|sys|bad format");
+        return;
     }
-    else {
+        int uid=g_io_ctx.get_uid(fd);
+        if(uid==-1){
+            conn->send("7|sys|please login first");
+            return;
+        }
+        int target_uid=atoi(parts[1].c_str());
+        if(target_uid<=0){
+            conn->send("7|sys|bad target_uid");
+            return;
+        }
+        if(target_uid==uid){
+            conn->send("7|sys|cannot chat with yourself");
+            return;
+        }
+        auto task=make_unique<PrivateChatMsg>();
+         task->fd          = fd;
+    task->session_id  = g_io_ctx.get_session(fd);
+    task->ip          = g_io_ctx.get_ip(fd);
+    task->sender_uid  = uid;
+    task->sender_name = g_io_ctx.get_username(fd);
+    task->target_uid  = target_uid;
+    task->content     = parts[2];
+
+    bool ok = business_queue.push(move(task));
+    if(!ok){
+        LOG_W("business queue full fd=%d",fd);
+        conn->send("7|sys|server busy");
+    }
+       g_business_queue_size=(int)business_queue.size();
+    }else if(msg_type==8){
+      int uid=g_io_ctx.get_uid(fd);
+      if(uid==-1){
+        conn->send("8|sys|please login first");
+        return;
+      }
+      auto users=g_io_ctx.get_online_users();
+      string body="8|";
+      for(size_t i=0;i<users.size();i++){
+        if(i>0)body+=";";
+        body+="uid="+to_string(users[i].first)+","+users[i].second;
+      }
+      conn->send(body);
+    }else {
         conn->send("unknown msg_type");
     }
 }
@@ -1142,15 +1247,29 @@ int main()
 
     // MainLoop跑起来，只负责accept
     mainLoop.loop();
-    
+    LOG_I("===mainLoop exited===");
     // 优雅退出
     g_pool_running = false;
     business_queue.notify_all();
+    LOG_I("===notify_all done ===");
+    threadPool.quitAll();
+    LOG_I("=== quitAll done ====");
+    // ★ join 加超时
+std::future<void> join_future = std::async(std::launch::async, [&]() {
     for (auto& t : g_thread_pool) {
         if (t.joinable()) t.join();
     }
+    LOG_I("===all workers joined ===");
+});
 
+if (join_future.wait_for(std::chrono::seconds(10)) == std::future_status::timeout) {
+    LOG_W("worker join timeout, force exit");
+    quick_exit(0);   // 强制退出
+}
+  LOG_I("=== join success ===");
     close(listenfd);
+    LOG_I("=== listenfd closed ===");
     g_pool.reset();
+    LOG_I("=== g_pool reset ===");
     return 0;
 }

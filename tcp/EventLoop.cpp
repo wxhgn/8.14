@@ -29,7 +29,7 @@ EventLoop::EventLoop()
         std::ostringstream oss;
         oss << threadId_;
         LOG_I("[SubLoop Monitor] thread=%s", oss.str().c_str());
-    }, 3.0, 3.0);
+    }, 30.0, true);
 }
 
 

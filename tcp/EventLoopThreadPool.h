@@ -16,7 +16,7 @@ public:
 
     void start();
     EventLoop* getNextLoop();
-
+    void quitAll();
 private:
     EventLoop* mainLoop_;
     int numThreads_;
