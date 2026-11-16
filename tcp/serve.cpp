@@ -460,7 +460,50 @@ public:
 unordered_map<int, shared_ptr<ConnEvent>> g_fd_conn_map;
 unordered_map<int, shared_ptr<Channel>> g_fd_channel_map;
 std::mutex g_conn_map_mtx;
-
+class BlacklistManager{
+    private:
+      mutex mtx_;
+      unordered_map<int,unordered_set<int>>blacklist_;
+      public:
+      void load(int owner_uid,vector<int>&blocked_uids){
+        lock_guard<mutex>lock(mtx_);
+        auto&s=blacklist_[owner_uid];
+        s.clear();
+        for(int b:blocked_uids)s.insert(b);
+      }
+      void clear(int owner_uid){
+        lock_guard<mutex>lock(mtx_);
+        blacklist_.erase(owner_uid);
+          }
+      bool isBlocked(int owner_uid,int target_uid){
+        lock_guard<mutex>lock(mtx_);
+        auto it=blacklist_.find(owner_uid);
+        if(it==blacklist_.end())return false;
+        return it->second.count(target_uid)>0;
+      }
+      void add(int owner_uid,int blocked_uid){
+        lock_guard<mutex>lock(mtx_);
+        blacklist_[owner_uid].insert(blocked_uid);
+      }
+      void remove(int owner_uid,int blocked_uid){
+        lock_guard<mutex>lock(mtx_);
+        auto it=blacklist_.find(owner_uid);
+      if(it!=blacklist_.end())
+        it->second.erase(blocked_uid);
+      }
+      vector<int>getList(int owner_uid){
+        lock_guard<mutex>lock(mtx_);
+        vector<int>res;
+        auto it=blacklist_.find(owner_uid);
+        if(it!=blacklist_.end()){
+            for(int b:it->second){
+                res.push_back(b);
+            }
+        }
+return res;
+      }
+};
+BlacklistManager g_blacklist;
 // ==================== ReplyTask ====================
 struct ReplyTask {
     int         fd         = -1;
@@ -528,7 +571,13 @@ public:
     virtual void handle(MYSQL* conn) = 0;
     virtual ~Message() = default;
 };
-
+class BlacklistMsg:public Message{
+    public:
+    int owner_uid=-1;
+    int target_uid=-1;
+    string op;
+    void handle(MYSQL*conn)override;
+};
 class LoginMsg : public Message {
 public:
     string username;
@@ -576,7 +625,9 @@ struct OfflineMsg{
 vector<OfflineMsg> db_load_offline_msgs(MYSQL* conn, int target_uid);
 void db_mark_msgs_read(MYSQL* conn, int target_uid);
 void broadcast(int fd, const std::string& msg);
-
+vector<int>db_load_blacklist(MYSQL*conn,int owner_uid);
+bool db_add_blacklist(MYSQL*conn,int owner_uid,int blocked_uid);
+bool db_remove_blacklist(MYSQL*conn,int owner_uid,int blocked_uid);
 // 【重点改造：不再全局wakeup，拿到conn，交给它所属loop runInLoop】
 void reply_dispatch(ReplyTask rt)
 {
@@ -640,7 +691,8 @@ void LoginMsg::handle(MYSQL* conn) {
         rt.uid        = uid;
         rt.reply_msg = string("login ok uid") + to_string(uid);
         db_insert_online_log(conn, uid, this->ip, "login");
-
+       auto blocked=db_load_blacklist(conn,uid);
+        g_blacklist.load(uid,blocked);
         ReplyTask broadcast_online;
         broadcast_online.fd         = -1;
         broadcast_online.reply_msg = "2|" + this->username + "|"+"online";
@@ -681,6 +733,15 @@ void PrivateChatMsg::handle(MYSQL*conn){
     if(sender_uid==-1||target_uid==-1){
         return;
     }
+    // ★ 检查：target 是否拉黑了 sender
+    if (g_blacklist.isBlocked(target_uid, sender_uid)) {
+        ReplyTask rt;
+        rt.fd         = fd;
+        rt.session_id = session_id;
+        rt.reply_msg  = "7|sys|you are blocked by this user";
+        reply_push(move(rt));
+        return;   // ★ 不落库，不推送
+    }
  int tfd  = g_io_ctx.find_fds_by_uid(target_uid);
  int is_read=(tfd!=-1)?1:0;
     db_insert_msg(conn,sender_uid,target_uid,2,"[private to "+to_string(target_uid)+"]"+content,is_read);
@@ -704,6 +765,23 @@ void PrivateChatMsg::handle(MYSQL*conn){
     ack.session_id=session_id;
     ack.reply_msg="7|sys|send to "+to_string(target_uid);
     reply_push(move(ack));
+}
+void BlacklistMsg::handle(MYSQL*conn){
+    if(owner_uid==-1||target_uid==-1)return;
+    bool ok=false;
+    if(op=="add"){
+        ok=db_add_blacklist(conn,owner_uid,target_uid);
+        if(ok)g_blacklist.add(owner_uid,target_uid);
+    }else if(op=="remove"){
+        ok=db_remove_blacklist(conn,owner_uid,target_uid);
+        if(ok)g_blacklist.remove(owner_uid,target_uid);
+    }
+     ReplyTask rt;
+    rt.fd         = fd;
+    rt.session_id = session_id;
+    rt.reply_msg  = ok ? ("11|ok|" + op + " " + to_string(target_uid))
+                       : ("11|fail|" + op + " failed");
+    reply_push(move(rt));
 }
 // ==================== MySQL 连接池 ====================
 class MySQLConnPool {
@@ -1050,6 +1128,50 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
         body+="uid="+to_string(users[i].first)+","+users[i].second;
       }
       conn->send(body);
+    }else if(msg_type==11){
+        int uid=g_io_ctx.get_uid(fd);
+        if(uid==-1){
+            conn->send("11|fail|please login first");
+            return;
+        }
+        if(parts.size()<2){
+            conn->send("11|fail|format error");
+            return;
+        }
+        string op=parts[1];
+        if(op=="add"||op=="remove"){
+            if(parts.size()<3){
+                conn->send("11|fail|bad target_uid.");
+                return;
+            }
+            int target_uid=atoi(parts[2].c_str());
+            if(target_uid<=0||target_uid==uid){
+                conn->send("11|fail|bad target_uid");
+                return;
+            }
+           auto task = make_unique<BlacklistMsg>();
+        task->fd          = fd;
+        task->session_id  = g_io_ctx.get_session(fd);
+        task->ip          = g_io_ctx.get_ip(fd);
+        task->owner_uid   = uid;
+        task->target_uid  = target_uid;
+        task->op          = op;
+
+        bool ok = business_queue.push(move(task));
+        if (!ok) {
+            conn->send("11|fail|server busy");
+        }
+    }else if(op=="list"){
+        auto list=g_blacklist.getList(uid);
+        string body="11|list|";
+        for(size_t i=0;i<list.size();i++){
+            if(i>0)body+=",";
+            body+=to_string(list[i]);
+        }
+        conn->send(body);
+        }else{
+            conn->send("11|fail|unknown op");
+        }
     }else {
         conn->send("unknown msg_type");
     }
@@ -1180,6 +1302,49 @@ void db_mark_msgs_read(MYSQL* conn, int target_uid) {
         LOG_E("mark read error: %s", mysql_error(conn));
     }
 }
+vector<int>db_load_blacklist(MYSQL*conn,int owner_uid){
+    vector<int>res;
+    char sql[256];
+    snprintf(sql,sizeof(sql),
+    "SELECT blocked_uid FROM user_blocklist where owner_uid=%d",owner_uid);
+    if(mysql_query(conn,sql)!=0){
+        LOG_E("load blacklist error: %s",mysql_error(conn));
+        return res;
+    }
+    MYSQL_RES*result=mysql_store_result(conn);
+    if(!result)return res;
+    MYSQL_ROW row;
+    while((row=mysql_fetch_row(result))){
+        res.push_back(atoi(row[0]));
+    }
+    mysql_free_result(result);
+    return res;
+}
+bool db_add_blacklist(MYSQL*conn,int owner_uid,int blocked_uid){
+    char sql[256];
+    snprintf(sql,sizeof(sql),
+       "insert ignore into user_blacklist(owner_uid,blocked_uid)"
+       "values(%d,%d)",
+       owner_uid,blocked_uid   
+    );
+    if(mysql_query(conn,sql)!=0){
+        LOG_E("addblacklist error : %s",mysql_error(conn));
+        return false;
+    }
+    return true;
+}
+bool db_remove_blacklist(MYSQL*conn,int owner_uid,int blocked_uid){
+    char sql[256];
+    snprintf(sql,sizeof(sql),
+"delete from user_blacklist"
+"where owner_uid=%d and blocked_uid=%d",
+  owner_uid,blocked_uid);
+  if(mysql_query(conn,sql)!=0){
+    LOG_E("remove blacklist error:%s",mysql_error(conn));
+    return false;
+  }
+  return true;
+}
 // ==================== worker ====================
 void worker() {
     while (g_pool_running.load()) {
@@ -1204,7 +1369,7 @@ void worker() {
         g_pool->return_conn(conn);
     }
 }
-
+#ifndef UNIT_TEST
 // ==================== main：MainLoop，只负责accept！ ====================
 int main()
 {
@@ -1334,3 +1499,4 @@ if (join_future.wait_for(std::chrono::seconds(10)) == std::future_status::timeou
     LOG_I("=== g_pool reset ===");
     return 0;
 }
+#endif
