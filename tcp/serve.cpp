@@ -34,7 +34,7 @@
 #include"Channel.h"
 #include"EpollPoller.h"
 #include "EventLoopThreadPool.h"
-
+#include "redis/RedisManager.h"
 using namespace std;
 
 // ===================== 宏配置 =====================
@@ -83,8 +83,8 @@ private:
     unordered_map<int, string>        fd_to_name;
     unordered_set<int>                online_fd_set;
     std::mutex mtx_;
-    
 public:
+   
     void update_fd_active(int fd) {
         std::lock_guard<std::mutex> lock(mtx_);
         auto now = chrono::steady_clock::now();
@@ -224,7 +224,7 @@ public:
 };
 
 IoContext g_io_ctx;
-
+RedisManager g_redis;
 // ==================== muduo风格回调类型定义 ====================
 using ConnectionCallback  = function<void(const shared_ptr<ConnEvent>&)>;
 using MessageCallback     = function<void(const shared_ptr<ConnEvent>&, const string&)>;
@@ -693,21 +693,29 @@ void LoginMsg::handle(MYSQL* conn) {
         db_insert_online_log(conn, uid, this->ip, "login");
        auto blocked=db_load_blacklist(conn,uid);
         g_blacklist.load(uid,blocked);
+        g_redis.update_presence(uid);
         ReplyTask broadcast_online;
         broadcast_online.fd         = -1;
         broadcast_online.reply_msg = "2|" + this->username + "|"+"online";
         reply_push(move(broadcast_online));
         LOG_I("login ok fd=%d,uid=%d",rt.fd,uid);
-        auto offline_msgs=db_load_offline_msgs(conn,uid);
+        auto offline_msgs=g_redis.pop_all_offline_msg(uid);
         for(auto&m:offline_msgs){
             ReplyTask off_rt;
             off_rt.fd=this->fd;
             off_rt.session_id=this->session_id;
-            off_rt.reply_msg="6|"+ to_string(m.sender_uid) + "|" +
-                                m.sender_name + "|" + m.content;
+            off_rt.reply_msg="6|"+m;
             reply_push(move(off_rt));
         }
-         db_mark_msgs_read(conn, uid);
+       /* if (!offline_msgs.empty()) {
+        Transaction tx(conn);
+        if (db_mark_msgs_read(conn, uid)) {
+            tx.commit();
+        } else {
+            LOG_E("mark offline msgs read failed, uid=%d", uid);
+            tx.rollback();
+        }
+    }*/
     } else {
         rt.reply_msg = "login fail";
     }
@@ -747,6 +755,8 @@ void PrivateChatMsg::handle(MYSQL*conn){
     db_insert_msg(conn,sender_uid,target_uid,2,"[private to "+to_string(target_uid)+"]"+content,is_read);
    
     if(tfd==-1){
+        string redis_msg=to_string(sender_uid)+"|"+sender_name+"|"+content;
+       g_redis.push_offline_msg(target_uid,redis_msg);
         ReplyTask rt;
         rt.fd=fd;
         rt.session_id=session_id;
@@ -997,6 +1007,7 @@ void clean_fd_with_log(int fd, Channel* ch) {
     string username = g_io_ctx.get_username(fd);
 
     if (uid != -1) {
+        g_redis.remove_presence(uid);
         auto task = make_unique<LogoutMsg>();
         task->fd         = fd;
         task->session_id = g_io_ctx.get_session(fd);
@@ -1080,6 +1091,10 @@ void onMessage(const shared_ptr<ConnEvent>& conn, const string& pkg)
     else if (msg_type == 4) { // 心跳
         LOG_I("recv ping fd=%d", fd);
         g_io_ctx.update_fd_active(fd);
+        int uid=g_io_ctx.get_uid(fd);
+        if(uid!=-1){
+            g_redis.update_presence(uid);
+        }
         conn->send("5|pong");
     }else if(msg_type==6){
          if(parts.size()<3){

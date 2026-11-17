@@ -1,4 +1,4 @@
-#pragma
+#pragma once
 #include<unistd.h>
 #include<sys/socket.h>
 class socket_fd
